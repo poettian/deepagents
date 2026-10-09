@@ -20,7 +20,7 @@ Uses the [Chinook database](https://github.com/lerocha/chinook-database) - a sam
 ### Prerequisites
 
 - Python 3.11 or higher
-- OpenRouter API key ([get one here](https://openrouter.ai/settings/keys))
+- OpenRouter API key ([get one here](https://openrouter.ai/keys))
 - (Optional) LangSmith API key for tracing ([sign up here](https://smith.langchain.com/))
 
 ### Installation
@@ -64,11 +64,21 @@ OPENROUTER_API_KEY=your_openrouter_api_key_here
 Optional:
 
 ```
+OPENROUTER_MODEL=deepseek/deepseek-v4.1-flash
 LANGSMITH_TRACING=true
 LANGSMITH_ENDPOINT=https://api.smith.langchain.com
 LANGSMITH_API_KEY=your_langsmith_api_key_here
 LANGSMITH_PROJECT=text2sql-deepagent
 ```
+
+The agent and SQL query checker both use `ChatOpenRouter`, defaulting to
+`deepseek/deepseek-v4.1-flash`. Set `OPENROUTER_MODEL` to use another OpenRouter
+model that supports tool calling.
+
+SQL tools use Python's built-in `sqlite3` with read-only connections. They expose
+table definitions and sample rows, execute queries, and use the model to check SQL.
+Filesystem tools resolve virtual paths under the example directory; `/AGENTS.md`
+and `/skills/` refer to files within that directory.
 
 ## Usage
 
@@ -133,9 +143,6 @@ Formatted Answer
 ```
 
 ### Configuration
-
-The agent and SQL query checker use `deepseek/deepseek-v4.1-flash` through
-`ChatOpenRouter`, which reads `OPENROUTER_API_KEY` from the environment.
 
 Deep Agents uses **progressive disclosure** with memory files and skills:
 
@@ -209,6 +216,7 @@ Top countries: USA ($1000), Canada ($500)...
 ```
 text-to-sql-agent/
 ├── agent.py                      # Core Deep Agent implementation with CLI
+├── sql_tools.py                  # Read-only SQLite tools and model-backed SQL checker
 ├── AGENTS.md                     # Agent identity and general instructions (always loaded)
 ├── skills/                       # Specialized workflows (loaded on-demand)
 │   ├── query-writing/
@@ -257,6 +265,12 @@ You can view:
 View your traces at: <https://smith.langchain.com/>
 
 ## Resources
+
+Run the offline tool tests with warnings treated as errors:
+
+```bash
+uv run python -W error -m unittest discover -s tests/unit_tests -v
+```
 
 - [Deep Agents Documentation](https://docs.langchain.com/oss/python/deepagents/overview)
 - [LangChain](https://www.langchain.com/)

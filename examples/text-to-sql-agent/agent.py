@@ -1,7 +1,7 @@
 import argparse
 import os
 import sys
-import warnings
+from pathlib import Path
 
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
@@ -10,15 +10,7 @@ from langchain_openrouter import ChatOpenRouter
 from rich.console import Console
 from rich.panel import Panel
 
-# SQL tools still depend on this package; scope its sunset notice to import time.
-with warnings.catch_warnings():
-    warnings.filterwarnings(
-        "ignore",
-        message=r"^`langchain-community` is being sunset and is no longer actively maintained\.",
-        category=DeprecationWarning,
-    )
-    from langchain_community.agent_toolkits import SQLDatabaseToolkit
-    from langchain_community.utilities import SQLDatabase
+from sql_tools import create_sql_tools
 
 # Load environment variables
 load_dotenv()
@@ -32,28 +24,25 @@ def create_sql_deep_agent():
     # Get base directory
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Connect to Chinook database
-    db_path = os.path.join(base_dir, "chinook.db")
-    db = SQLDatabase.from_uri(f"sqlite:///{db_path}", sample_rows_in_table_info=3)
-
     # Share the OpenRouter model between the agent and SQL query checker.
-    model = ChatOpenRouter(model="deepseek/deepseek-v4.1-flash", temperature=0)
+    model = ChatOpenRouter(
+        model=os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash"),
+        temperature=0,
+        # Let the SDK own and close its clients without attribution headers.
+        app_url=None,
+        app_title=None,
+    )
 
-    # Create SQL toolkit and get tools
-    toolkit = SQLDatabaseToolkit(db=db, llm=model)
-    sql_tools = toolkit.get_tools()
+    sql_tools = create_sql_tools(Path(base_dir) / "chinook.db", model)
 
     # Create the Deep Agent with all parameters
     agent = create_deep_agent(
         model=model,
-        memory=["./AGENTS.md"],  # Agent identity and general instructions
-        skills=[
-            "./skills/"
-        ],  # Specialized workflows (query-writing, schema-exploration)
+        memory=["/AGENTS.md"],  # Agent identity and general instructions
+        skills=["/skills/"],  # Query-writing and schema-exploration workflows
         tools=sql_tools,  # SQL database tools
         subagents=[],  # No subagents needed
-        # Resolve relative paths under base_dir and allow native absolute paths.
-        backend=FilesystemBackend(root_dir=base_dir, virtual_mode=False),
+        backend=FilesystemBackend(root_dir=base_dir, virtual_mode=True),
     )
 
     return agent
@@ -62,7 +51,7 @@ def create_sql_deep_agent():
 def main():
     """Main entry point for the SQL Deep Agent CLI"""
     parser = argparse.ArgumentParser(
-        description="Text-to-SQL Deep Agent powered by LangChain Deep Agents and DeepSeek V4.1 Flash via OpenRouter",
+        description="Text-to-SQL Deep Agent powered by LangChain Deep Agents and OpenRouter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

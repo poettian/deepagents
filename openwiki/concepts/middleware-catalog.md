@@ -1,132 +1,146 @@
 ---
 type: capability reference
-title: Middleware Capability Catalog
-description: Capability-to-owner lookup for Deep Agents middleware, covering request shaping, filesystem access, context, memory, skills, delegation, quality gates, permissions, caching, and profile enforcement. Use it to select the owning layer and understand its important lifecycle boundaries.
-tags: [middleware, deepagents, filesystem, context-management, memory, skills, subagents, permissions]
+title: Middleware Catalog
+description: Deep Agents middleware responsibilities, state ownership, request and tool effects, and the assembly order that makes skills, subagents, profiles, and tool visibility safety-critical.
+tags: [middleware, deepagents, skills, subagents, profiles, tools]
 sources:
   - id: openwiki-source-0fc0e47059e4d07e23e50be2
     resource: repo://libs/deepagents/deepagents/graph.py
   - id: openwiki-source-fc54598423086acf9d53d9fd
     resource: repo://libs/deepagents/deepagents/middleware/__init__.py
-  - id: openwiki-source-0fb4155c19dd248acd3ffe4f
-    resource: repo://libs/deepagents/deepagents/middleware/_fs_interrupt.py
-  - id: openwiki-source-9841bc6daf811e4615c54a88
-    resource: repo://libs/deepagents/deepagents/middleware/_message_eviction.py
-  - id: openwiki-source-64b92f60456305edc143f48a
-    resource: repo://libs/deepagents/deepagents/middleware/_overflow_clip.py
-  - id: openwiki-source-7a16b9a53a07e882b7305459
-    resource: repo://libs/deepagents/deepagents/middleware/_prompt_caching.py
-  - id: openwiki-source-421bc4b065189ae1165ca326
-    resource: repo://libs/deepagents/deepagents/middleware/_state.py
+  - id: openwiki-source-303a7196a0e1a36cc078621b
+    resource: repo://libs/deepagents/deepagents/middleware/_blob_offload.py
+  - id: openwiki-source-5c9c6a877b43f30407158658
+    resource: repo://libs/deepagents/deepagents/middleware/_skill_tools.py
   - id: openwiki-source-8b1aaf77fc0430fd00711a73
     resource: repo://libs/deepagents/deepagents/middleware/_tool_exclusion.py
-  - id: openwiki-source-454ab6b822ad87c53f679f58
-    resource: repo://libs/deepagents/deepagents/middleware/_video.py
-  - id: openwiki-source-e51c4102234507d1529a2440
-    resource: repo://libs/deepagents/deepagents/middleware/async_subagents.py
   - id: openwiki-source-fed4b84a38685f37e58018c5
     resource: repo://libs/deepagents/deepagents/middleware/filesystem.py
   - id: openwiki-source-46a23efe78a78f9b3cd75d00
     resource: repo://libs/deepagents/deepagents/middleware/memory.py
-  - id: openwiki-source-13b8cea81b8a29f0950cc836
-    resource: repo://libs/deepagents/deepagents/middleware/patch_tool_calls.py
-  - id: openwiki-source-b93c32bc33a8fa17b52b8a0e
-    resource: repo://libs/deepagents/deepagents/middleware/rubric.py
   - id: openwiki-source-66cf9d0832d3cb55bec2b5ed
     resource: repo://libs/deepagents/deepagents/middleware/skills.py
   - id: openwiki-source-114a1c7a58992fa867a94ef0
     resource: repo://libs/deepagents/deepagents/middleware/subagents.py
-  - id: openwiki-source-f763e99e439a1356866a7aa4
-    resource: repo://libs/deepagents/deepagents/middleware/summarization.py
-generated: { by: "openwiki/0.4.2", at: "2026-09-18T16:46:37.183Z" }
+  - id: openwiki-source-837c84a3f3120bc778033547
+    resource: repo://libs/deepagents/deepagents/middleware/unsupported_content.py
+  - id: openwiki-source-c71ac20477155a66b7a8c60a
+    resource: repo://libs/deepagents/tests/unit_tests/middleware/test_skill_tools.py
+  - id: openwiki-source-6d183faf1a4bc5a5ba451aba
+    resource: repo://libs/deepagents/tests/unit_tests/test_graph.py
 verified:
   - by: openwiki/0.4.2
-    at: 2026-09-18T16:46:37.183Z
+    at: 2026-10-08T08:07:53.482Z
+generated: { by: "openwiki/0.4.2", at: "2026-10-08T08:07:53.482Z" }
 ---
 
-# Middleware Capability Catalog
+# Middleware Catalog
 
-`deepagents.middleware` is the public import surface for the SDK's built-in middleware. Choose middleware when a capability must affect *every* model request: an `AgentMiddleware` wrapper can shape the system prompt, advertised tools, messages, and typed cross-turn state before the LLM is called. A consumer callable passed in `tools=` instead runs only after the model selects it.
+`deepagents.middleware` is the public import surface for filesystem, summarization, skills, synchronous and asynchronous subagents, memory, rubric, and unsupported-content middleware, plus their key types. `create_deep_agent()` assembles those layers around LangChain's agent lifecycle; it also uses internal layers such as `PatchToolCallsMiddleware`, prompt caching, and the final tool-exclusion filter.
 
-This page is a capability lookup, not a complete construction guide. See [Middleware stack](../architecture/middleware-stack.md) for ordering, [Context management](context-management.md) for compaction details, [Subagents and skills](subagents-skills.md) for delegation design, and [Filesystem tools](tools-filesystem.md) for tool contracts.
+## Why middleware rather than an ordinary tool?
 
-## Capability-to-owner lookup
-
-| Need | Owner and entrypoint | Lifecycle / boundary |
-| --- | --- | --- |
-| Backend-backed file tools and large-result control | `FilesystemMiddleware` | Supplies the filesystem tools; shapes requests and intercepts tool results. |
-| Automatic or model-invoked conversation compaction | `SummarizationMiddleware`; `SummarizationToolMiddleware`; `create_summarization_tool_middleware` | Creates a private summarization event and recoverable backend history. |
-| Always-available project instructions | `MemoryMiddleware` | Loads `AGENTS.md` before the run, then normally injects it for each model call. |
-| Discoverable, on-demand workflows | `SkillsMiddleware` | Discovers `SKILL.md` metadata before a run and advertises metadata, not full instructions, in the prompt. |
-| Inline specialist delegation | `SubAgentMiddleware`, `SubAgent`, `CompiledSubAgent` | Provides blocking `task` calls to local/compiled child agents. |
-| Remote background delegation | `AsyncSubAgentMiddleware`, `AsyncSubAgent` | Provides start/check/update/cancel/list tools and persists task records. |
-| Validate a natural-stop response against a definition of done | `RubricMiddleware` | Calls a structured-output grader after the main loop would stop; can jump back to the model. |
-| Repair interrupted message history | `PatchToolCallsMiddleware` | Runs at `before_agent` and completes dangling call/result pairs. |
-| Filesystem approval conversion | `_fs_interrupt` plus graph assembly | Translates interrupt-mode rules to HITL predicates; it is separate from filesystem deny enforcement. |
-| Prompt-cache optimization | `append_prompt_caching_middleware` | Adds provider middleware during graph assembly before memory. |
-| Harness/profile tool consistency | `_ToolExclusionMiddleware` | Filters tools at model-call time and rejects excluded call names at dispatch. |
-
-`deepagents.middleware` re-exports the public filesystem, memory, skills, delegation, summarization, and rubric classes and associated supporting types through its `__all__`. `PatchToolCallsMiddleware` is current built-in harness behavior—graph construction imports and appends it—but it is not part of that package-level export list. Underscore-prefixed modules are assembly helpers rather than the stable consumer import surface.
-
-## Request and state lifecycle
+A callable passed as `tools=[...]` is selected and invoked *after* the model requests it. An `AgentMiddleware` participates before and around the model and tool boundaries. In particular, `wrap_model_call()` can change every outbound request's system message, messages, selected tools, or behavior based on state and the resolved model; tool wrappers can validate or replace a pending tool call. Use middleware for request-sensitive behavior, cross-turn state, or policy. Use an ordinary tool for a self-contained capability.
 
 ```mermaid
 flowchart TD
-    Start["Agent run starts"] --> Before["before_agent loaders and repair"]
-    Before --> Request["Middleware wraps model request"]
-    Request --> Model["Model receives prompt messages and tools"]
-    Model --> Calls{"Tool calls"}
-    Calls -->|"yes"| ToolWrap["Tool wrappers enforce or transform result"]
-    ToolWrap --> Request
-    Calls -->|"no"| Rubric{"Rubric supplied"}
-    Rubric -->|"no"| Finish["Finish"]
-    Rubric -->|"needs revision"| Feedback["Synthetic grader HumanMessage"]
-    Feedback --> Request
-    Rubric -->|"terminal verdict"| Finish
+    Run["Agent run"] --> Setup["Lifecycle hooks load or update state"]
+    Setup --> Request["Model wrappers shape prompt messages and tools"]
+    Request --> Model["Model call"]
+    Model --> Choice{"Tool calls returned"}
+    Choice -->|"yes"| Tool["Tool wrappers validate and execute"]
+    Tool --> Request
+    Choice -->|"no"| Finish["Run completes"]
 ```
 
-This shows the principal hook boundaries: loaders and repair run before the agent, model wrappers change the request before each LLM call, and tool wrappers can transform results. `RubricMiddleware` uses the natural-stop boundary to create a controlled revision loop.
+This lifecycle shows why middleware has control before every model request while an ordinary tool runs only after the model selects it.
 
-Middleware-owned state should be marked `PrivateStateAttr` when it must not cross a subagent or appear in public agent I/O. `_state.private_state_field_names` resolves those annotations at runtime; an unresolvable schema is warned about and skipped, so its nominally private fields can be forwarded. Keep synchronous and async hooks behaviorally aligned when extending a capability.
+## Public catalog
 
-## Filesystem and permissions
+| Responsibility | Primary entrypoint | State and request or tool effect |
+| --- | --- | --- |
+| Files, shell, and file policy | `FilesystemMiddleware`, `FilesystemPermission` | Supplies file and execution tools, adapts capabilities to the backend, enforces filesystem rules, and manages large or binary read results. |
+| Context management | `SummarizationMiddleware`, `SummarizationToolMiddleware` | Compacts history automatically or through `compact_conversation`. |
+| Persistent instructions | `MemoryMiddleware` | Loads configured `AGENTS.md` sources into state and normally appends their content to the system prompt. |
+| Skills and conditional tools | `SkillsMiddleware`, `SkillMetadata`, `SkillsState`, `SkillToolResolver` | Loads a skill index, adds progressive-disclosure instructions, and exposes skill tools only when their instruction anchor is present. |
+| Synchronous delegation | `SubAgentMiddleware`, `SubAgent`, `CompiledSubAgent` | Provides the blocking `task` tool for declarative or precompiled workers. |
+| Background delegation | `AsyncSubAgentMiddleware`, `AsyncSubAgent` | Provides Agent Protocol task launch and management without blocking the parent. |
+| Completion review | `RubricMiddleware` | Grades a proposed completion and can append revision feedback and return control to the model. |
+| Provider compatibility | `UnsupportedContentMiddleware` | Replaces model-unsupported human and tool content blocks in the outbound request only. |
 
-`FilesystemMiddleware` owns `ls`, `read_file`, `write_file`, `edit_file`, `delete`, `glob`, `grep`, and optionally `execute`. An explicit `tools` allowlist must include `read_file`; unsupported `execute` and `delete` entries are not made usable merely by naming them. The default backend is `StateBackend()`, whereas execution requires a backend with the relevant sandbox capability. The constructor rejects a backend factory, nonpositive execution timeout, and a nonpositive configured grep cap.
+### Filesystem, memory, and compatibility seams
 
-At model-call time, it applies its prompt, filters unavailable tools, normalizes media ordering, scrubs unsupported multimodal blocks, and can offload an oversized latest human message. At tool-call time it offloads oversized text output to `<artifacts_root>/large_tool_results/{tool_call_id}`, replacing text with a line-numbered head-and-tail preview and retrieval instructions while retaining non-text blocks. Backend write failure retains the original message; exceptions from the tool itself deliberately propagate. Video `read_file` support is optional: `_video` lazily probes/imports PyAV and treats offset and limit as seconds, returning sampled text-and-image frame blocks.
+Filesystem permissions are evaluated in declaration order and the first matching rule wins; unmatched operations are allowed. `deny` returns a permission error, whereas `interrupt` contributes an approval rule to `HumanInTheLoopMiddleware` (with caller-supplied `interrupt_on` taking precedence for a tool). These rules apply to built-in filesystem tools, not direct backend use. Subagents inherit parent permissions unless their specification supplies a replacement list.
 
-Filesystem permissions have two distinct owners. `FilesystemMiddleware` enforces deny rules in tool implementations. During graph assembly, `_fs_interrupt` converts `interrupt` rules to `HumanInTheLoopMiddleware` configuration with path-aware `when` predicates: exact operations match their call path, while bulk operations protect overlapping subtrees and conservatively interrupt pathless searches. Execution-capable backends reject unscoped permission configurations because execute-level permissions do not exist; approval is not an authorization feature supplied by tool exclusion.
+With `offload_binary_content=True`, `FilesystemMiddleware` content-addresses valid base64 `read_file` payloads under `{artifacts_root}/blobs/<sha256>`, stores `deepagents_blob` references, and rehydrates verified payloads for a model request. A failed upload remains inline; missing, malformed, tampered, or unavailable blobs become a text notice.
 
-## Context, memory, and caching
+`MemoryMiddleware` loads sources once when `memory_contents` is absent, strips HTML comments before prompt injection, and permits `system_prompt=None` when callers want state without injected instructions. In the assembled graph it requests an Anthropic-only cache-control breakpoint after the generic caching middleware. `UnsupportedContentMiddleware` must be late: it evaluates the *actual request model* and replaces unsupported multimodal blocks only in a copied request, preserving the original thread for a later capable model.
 
-`SummarizationMiddleware` counts the effective prompt—including tool schemas when its counter supports them—and may truncate old large tool arguments before compaction. When configured thresholds are crossed, it offloads older messages and generates a summary; its private event reconstructs subsequent effective requests as the summary plus retained recent messages. The session identifier persists so history appends to one `/conversation_history/{session_id}.md` file. Inline media is stored separately and referenced from that history.
+## Skills: progressive disclosure and a per-request gate
 
-If a normal request raises `ContextOverflowError`, summarization is attempted even when the ordinary trigger did not fire. The fallback clips a sufficiently large trailing `ToolMessage` batch: `read_file` is head-sliced with a pointer to its original file, while other results are offloaded and stubbed. Failed history offload does not prevent summarization, but the summary has no recovery path and a warning is emitted.
+`SkillsMiddleware` enumerates `SKILL.md` files through backend APIs. It loads sources in order, with the last duplicate name winning, and caches the result in per-thread `skills_metadata`: a list, including `[]`, suppresses another load; missing or `None` reloads. Load diagnostics are recorded privately in `skills_load_errors` and logged. The default prompt lists metadata and asks the model to `read_file` the selected skill; `system_prompt=None` suppresses only that prompt addition.
 
-`SummarizationToolMiddleware` registers `compact_conversation`, reusing the automatic middleware's engine and event state. It is only invoked as a tool call, and its eligibility gate prevents premature compaction. The factory produces both layers with defaults derived from the resolved model profile.
+`pinned_skills` is an explicit alternative to waiting for a read. Before the next model call, each known, readable named skill is appended as a `HumanMessage` containing its `SKILL.md` body without frontmatter, then the pending names are cleared. Parallel writes accumulate; unknown or unreadable names are skipped. Pinning is therefore both an instruction-delivery mechanism and a valid anchor for its tools.
 
-`MemoryMiddleware` loads configured `AGENTS.md` sources once into private `memory_contents`; sources are ordered, missing files are skipped, other download errors fail loading, and HTML comments are stripped before presentation. By default it appends that persistent reference material to the system prompt; `system_prompt=None` suppresses only injection. With `add_cache_control=True`, the last system block receives Anthropic ephemeral cache control only when the request model is `ChatAnthropic`.
+A skill may declare space-separated `metadata.include_tools`. Tools owned by the skills middleware are intentionally omitted from ordinary agent registration. A successful `read_file` result for the loaded skill's `SKILL.md`—or a pinned skill message—anchors disclosure only while it remains in the request messages. A call cannot use a gated tool before that anchor, including in the same model turn that requested the read; compaction that removes the anchor withdraws it.
 
-`append_prompt_caching_middleware` always adds Anthropic prompt caching with unsupported models ignored, and conditionally adds Bedrock and Fireworks equivalents if their optional integration packages are importable. Graph construction places this provider caching before optional memory so the latter can establish its second Anthropic breakpoint.
+```mermaid
+sequenceDiagram
+    participant Agent as Agent lifecycle
+    participant Skills as Skills middleware
+    participant Model as Model
+    participant Tools as Tool node
+    Agent->>Skills: model request with messages
+    Skills->>Skills: find visible skill read or pin anchors
+    Skills->>Skills: resolve include names and record gated tools
+    Skills->>Model: prompt plus disclosed schemas
+    Model->>Tools: tool call
+    Tools->>Skills: pending call
+    Skills->>Skills: re-resolve recorded include name
+    Skills->>Tools: attach tool only when still disclosed
+```
 
-## Skills and delegation
+This sequence shows that visibility is determined for one request and execution is checked again at the tool boundary.
 
-`SkillsMiddleware` implements progressive disclosure: each source is listed through backend APIs, direct child directories' `SKILL.md` files are downloaded, parsed for YAML metadata, and shown in the system prompt with a path for later `read_file`. It supports path or `(path, label)` sources and processes them in order, so the last skill with a duplicate name wins. Discovery is stored in `skills_metadata`, which is omitted from output and from subagent state, and is skipped when checkpointed state already holds a list, even an empty one; setting the field to `None` requests a reload on the next run; source failures are recorded and logged rather than silently turning into instructions.
+A `SkillToolResolver` may map one include name to several runtime-specific tools. The middleware records only gated tools from the latest model call in private `_skill_tools_disclosed`, mapping tool name to include name, and re-resolves that include name at execution. An undisclosed call, a malformed old record, or a tool the resolver no longer returns remains an invalid tool instead of executing a hidden or stale capability. Resolver output should consequently be stable for a request and inexpensive or cached.
 
-`SubAgentMiddleware` owns the `task` tool. It validates that there is at least one subagent and creates an ephemeral child call that blocks until completion. Isolated children receive the delegated description; experimental `mode="fork"` continues effective parent conversation and prompt context but forbids child-defined skills and refuses recursive delegation. A child returns structured output as JSON when present, otherwise its final nonempty AI text. Graph assembly calculates private-state keys across schemas and supplies them to this middleware so they can be stripped across the child boundary.
+Existing request tools named by an include are already callable. If such a tool is marked `extras={"defer_loading": True}`, reading or pinning the skill reveals its schema but does not gate execution. For ordinary models, disclosure augments request tool bindings. Specific Anthropic models and exact `ChatOpenAI` Responses models support provider-native, mid-conversation additions after the tool-result batch; schemas rejected by Anthropic are withheld so the recorded gate remains consistent with what the model saw.
 
-`AsyncSubAgentMiddleware` is separate remote machinery for Agent Protocol servers. It requires nonempty uniquely named definitions and uses cached LangGraph SDK clients keyed by URL and headers. `start_async_task` creates a remote thread and run, immediately returns its task id, and saves an `async_tasks` record in agent state. The check, update, cancel, and list tools operate only on those tracked records. A URL-less local ASGI transport requires asynchronous parent invocation; the synchronous path requires a reachable URL.
+## Subagents, state boundaries, and skill sources
 
-## Rubric, repair, and profile enforcement
+A declarative `SubAgent` receives an independently assembled middleware stack; a `CompiledSubAgent` supplies its own runnable. Isolated workers receive only the delegated task by default. Experimental `mode="fork"` instead continues the parent's effective, compacted conversation, rebuilds inherited prompt-producing behavior, and prevents recursive delegation. A fork cannot declare its own `skills`: it inherits the top-level sources so its skill registry does not diverge.
 
-`RubricMiddleware` is inert without a caller-supplied `rubric`. At a natural agent stop it sends a bounded, sanitized transcript to a lazily built separate grader agent, whose `GraderResponse` is constrained to `satisfied`, `needs_revision`, or `failed` and criterion-level consistency. Only `needs_revision` appends tagged grader feedback as a synthetic `HumanMessage` and jumps back to the model. `max_iterations_reached` and `grader_error` are middleware terminal results, not grader verdicts; non-satisfied terminal outcomes preserve the main agent's last response, so callers must inspect private state, events, or the callback to branch. Grader transcript contents are explicitly treated as untrusted observation, while the rubric defines done.
+Ordinary parent/subagent exchange excludes `skills_metadata`, `pinned_skills`, and the last skill-tool disclosure, as well as fields marked `PrivateStateAttr`; this prevents a worker's skill loading and per-call authorization record from leaking across agents. A custom state schema whose annotations cannot be resolved at runtime is a risk boundary: its private fields cannot be discovered and are forwarded with a warning.
 
-`PatchToolCallsMiddleware` makes resumed history structurally safe before the agent starts. For every valid or invalid AI tool call with an id that has no `ToolMessage`, it inserts an error `ToolMessage`: valid calls are recorded as incomplete (possibly cancelled or interrupted), while invalid calls are recorded as malformed or truncated. It then rewrites the complete message list.
+Skill configuration is scoped deliberately:
 
-Profiles may omit middleware and tools. `_ToolExclusionMiddleware` is deliberately appended after custom middleware: it removes excluded tools from the model request and rejects an excluded name at the tool-call boundary, preventing a custom request wrapper from re-advertising it. This aligns advertised and executable tools; it is not a security boundary.
+- `create_deep_agent(skills=[...])` populates the automatic main and default general-purpose stacks. A declared isolated worker must use its own `skills` or its own standard-named `SkillsMiddleware`; a fork inherits the top-level sources.
+- A custom `SkillsMiddleware` named `SkillsMiddleware` takes the reserved skills slot. When `skills=None`, its sources also supply the automatic stack and general-purpose worker; replacements with the same name keep the slot, and the last replacement wins.
+- A differently named `SkillsMiddleware` subclass is ordinary custom middleware. It does not create or replace the automatic skills slot.
+- The default general-purpose worker mirrors only caller middleware that replaces one of its own default slots. New caller middleware stays main-agent-only.
 
-## Change and test guidance
+## Assembly order and safety-critical replacement
 
-Add a plain tool for isolated, consumer-specific work; add middleware only when request shaping, stack-wide availability, or persistent state is required. Keep storage behind `BackendProtocol`, keep sensitive or non-propagating values private, and preserve recovery behavior when a backend offload fails. Keep filesystem policy enforcement distinct from profile presentation filtering and HITL assembly.
+The main stack starts with `FilesystemMiddleware`, synchronous subagents when available, summarization, `PatchToolCallsMiddleware`, and asynchronous subagents when configured. New caller middleware is inserted immediately after that core. Profile middleware, automatic skills, prompt caching, optional memory, optional HITL, and unsupported-content adaptation form the tail; profile tool exclusion is appended last.
 
-Focused coverage is in `tests/unit_tests/middleware/`: filesystem initialization and video behavior, memory and skills sync/async behavior, compaction and summarization factory behavior, rubric iteration, subagent initialization, tool exclusion, and tool schemas. Also run the relevant unit coverage in `tests/unit_tests/` for permissions, synchronous/async subagents, middleware stack construction, and profiles, plus integration coverage in `tests/integration_tests/` for filesystem, HITL, sandbox, and subagent boundaries when changing assembly behavior.
+```mermaid
+flowchart LR
+    Core["Filesystem, subagents, summarization, repair, async subagents"] --> Custom["New caller middleware"]
+    Custom --> Profile["Profile middleware"]
+    Profile --> Skills["Automatic skills"]
+    Skills --> Cache["Prompt caching"]
+    Cache --> Memory["Optional memory"]
+    Memory --> Hitl["Optional HITL"]
+    Hitl --> Content["Unsupported content"]
+    Content --> Filter["Profile tool exclusion last"]
+```
+
+This is the normal main-stack assembly; absent optional entries are simply skipped.
+
+Name controls replacement. A custom middleware whose `.name` remains present replaces the corresponding layer in place; otherwise it is inserted after the last core layer and before the tail. Thus replacing `SkillsMiddleware` by name preserves its placement, while adding a second, novel skills layer changes wrapper interactions. Profile `excluded_middleware` is applied during assembly; it rejects an unmatched, ambiguous, private-name, or protected-scaffolding exclusion rather than silently creating a degraded agent. `FilesystemMiddleware` and `SubAgentMiddleware` are protected scaffolding.
+
+Skills belongs after compaction and routing or fallback middleware, but before caching, so it sees compacted messages and the actual model. The final `_ToolExclusionMiddleware` removes excluded tool names from the request **and** rejects matching tool calls at execution. It prevents later custom wrappers from restoring profile-excluded tools, but is explicitly a visibility and consistency guard rather than a security boundary; filesystem permissions are the authorization mechanism.
+
+## Focused regression coverage
+
+When changing this stack, test the ordering rather than only individual methods: name replacement versus new insertion; protected and final profile filtering; placement of skills after fallback or routing and before caching; default, declarative, and forked skill sourcing; and general-purpose inheritance. Skill-tool coverage should exercise read and pin anchors, same-turn rejection, compaction withdrawal, resolver re-resolution, deferred tools, and provider-specific inline disclosure. These tests protect the invariant that the model's advertised tools, the selected model, and tool-time execution agree.

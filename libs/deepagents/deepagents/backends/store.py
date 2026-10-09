@@ -347,7 +347,7 @@ class StoreBackend(BackendProtocol):
                 fd = self._convert_store_item_to_file_data(item)
             except ValueError:
                 continue
-            size = len(file_data_to_string(fd))
+            size = len(file_data_to_string(fd).encode("utf-8"))
             infos.append(
                 {
                     "path": item.key,
@@ -443,6 +443,7 @@ class StoreBackend(BackendProtocol):
             file_data = update_file_data(existing_file_data, content)
         else:
             file_data = create_file_data(content)
+        file_data["encoding"] = "utf-8"
         store_value = self._convert_file_data_to_store_value(file_data)
         store.put(namespace, file_path, store_value)
         return WriteResult(path=file_path)
@@ -465,6 +466,7 @@ class StoreBackend(BackendProtocol):
             file_data = update_file_data(existing_file_data, content)
         else:
             file_data = create_file_data(content)
+        file_data["encoding"] = "utf-8"
         store_value = self._convert_file_data_to_store_value(file_data)
         await store.aput(namespace, file_path, store_value)
         return WriteResult(path=file_path)
@@ -641,7 +643,7 @@ class StoreBackend(BackendProtocol):
         infos: list[FileInfo] = []
         for p in paths:
             fd = files.get(p)
-            size = len(file_data_to_string(fd)) if fd else 0
+            size = len(file_data_to_string(fd).encode("utf-8")) if fd else 0
             infos.append(
                 {
                     "path": p,

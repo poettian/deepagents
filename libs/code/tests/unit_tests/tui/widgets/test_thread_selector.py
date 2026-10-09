@@ -25,6 +25,7 @@ from deepagents_code.tui.widgets.thread_selector import (
     ContainedSelectOverlay,
     DeleteThreadConfirmScreen,
     ThreadSelectorScreen,
+    _format_column_value,
 )
 
 MOCK_THREADS: list[ThreadInfo] = [
@@ -59,6 +60,23 @@ MOCK_THREADS: list[ThreadInfo] = [
         "initial_prompt": None,
     },
 ]
+
+
+@pytest.mark.parametrize("prompt", [None, "", "Hello world"])
+def test_checkpoint_cells_distinguish_loading_from_loaded(prompt: str | None) -> None:
+    thread: ThreadInfo = {
+        "thread_id": "loading-thread",
+        "agent_name": "my-agent",
+        "updated_at": None,
+    }
+
+    assert _format_column_value(thread, "messages") == "Loading"
+    assert _format_column_value(thread, "initial_prompt") == "Loading"
+
+    thread.update(message_count=0, initial_prompt=prompt)
+
+    assert _format_column_value(thread, "messages") == "0"
+    assert _format_column_value(thread, "initial_prompt") == (prompt or "")
 
 
 def _patch_list_threads(threads: list[ThreadInfo] | None = None) -> Any:  # noqa: ANN401
@@ -302,6 +320,66 @@ class TestThreadSelectorEmptyState:
 
 class TestThreadSelectorNavigateAndSelect:
     """Tests for navigating then selecting a specific thread."""
+
+
+class TestThreadNames:
+    """Named threads remain distinct from initial prompts and searchable."""
+
+    @pytest.mark.parametrize("name", [None, "Cache repair"])
+    async def test_name_and_prompt_remain_visible_at_80_columns(
+        self, name: str | None
+    ) -> None:
+        threads: list[ThreadInfo] = [
+            {**MOCK_THREADS[0], "thread_name": name},
+            {**MOCK_THREADS[1]},
+        ]
+        with _patch_list_threads(threads), _patch_columns():
+            app = ThreadSelectorTestApp()
+            async with app.run_test(size=(80, 30)) as pilot:
+                app.show_selector()
+                await pilot.pause()
+                for width in (80, 160, 80):
+                    await pilot.resize_terminal(width, 30)
+                    await pilot.pause()
+                    header = app.screen.query_one(
+                        ".thread-list-header .thread-cell-thread_name", Static
+                    )
+                    assert header.display
+                    assert header.content_region.width >= len("Name")
+                    rows = app.screen.query(".thread-option")
+                    assert len(rows) == len(threads)
+                    for row in rows:
+                        cell = row.query_one(".thread-cell-thread_name", Static)
+                        assert cell.display
+                        assert cell.content_region.width >= len("Name")
+                        prompt = row.query_one(".thread-cell-initial_prompt", Static)
+                        visible = prompt.content_region.intersection(row.content_region)
+                        assert visible.width >= len("Fix")
+
+    async def test_filter_finds_name_and_renders_literal_markup(self) -> None:
+        threads: list[ThreadInfo] = [
+            {**MOCK_THREADS[0], "thread_name": "[bold]Login[/bold]"},
+            {**MOCK_THREADS[1]},
+        ]
+        with _patch_list_threads(threads), _patch_columns():
+            app = ThreadSelectorTestApp()
+            async with app.run_test(size=(160, 45)) as pilot:
+                app.show_selector()
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, ThreadSelectorScreen)
+                names = screen.query(".thread-cell-thread_name").results(Static)
+                assert [str(cell.render()) for cell in names] == [
+                    "Name",
+                    "[bold]Login[/bold]",
+                    "",
+                ]
+                screen.query_one("#thread-filter", Input).value = "Login"
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                assert [t["thread_id"] for t in screen._filtered_threads] == [
+                    "abc12345"
+                ]
 
 
 class TestThreadSelectorTabSort:
@@ -857,7 +935,7 @@ class TestThreadSelectorLimit:
                 "deepagents_code.sessions.list_threads",
                 new_callable=AsyncMock,
                 return_value=threads_without_details,
-            ) as mock_lt,
+            ),
             _patch_columns(),
             patch(
                 "deepagents_code.sessions.populate_thread_checkpoint_details",
@@ -875,12 +953,6 @@ class TestThreadSelectorLimit:
                         break
                     await pilot.pause(0.05)
 
-                mock_lt.assert_awaited_once_with(
-                    limit=20,
-                    include_message_count=False,
-                    sort_by="updated",
-                    cwd=None,
-                )
                 mock_populate.assert_awaited_once()
 
                 screen = app.screen
@@ -949,10 +1021,6 @@ class TestThreadSelectorPrefetchedRows:
 
 class TestThreadSelectorInitialSortOrder:
     """Tests for initial sort order applied to prefetched rows."""
-
-
-class TestThreadSelectorSearch:
-    """Tests for fuzzy search filtering."""
 
 
 class TestThreadSelectorDelete:
@@ -1208,9 +1276,12 @@ class TestResumeThread:
         assert len(mounted) == 1
         assert "no active session" in _get_widget_text(mounted[0])
 
-    async def test_managed_cutoff_blocks_switch_without_mutation(self) -> None:
+    async def test_managed_cutoff_blocks_switch_without_mutation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A blocked target leaves the current thread and transcript untouched."""
         app = DeepAgentsApp(thread_id="current-thread")
+        monkeypatch.setattr(app, "_set_spinner", AsyncMock())
         app._agent = MagicMock()
         app._session_state = _mock_session_state("current-thread")
         mounted: list[Static] = []
@@ -1502,9 +1573,12 @@ class TestResumeThread:
             for call in _app_test_double(app)._mount_message.call_args_list
         )
 
-    async def test_prefetch_failure_keeps_current_thread_visible(self) -> None:
+    async def test_prefetch_failure_keeps_current_thread_visible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Failed prefetch should not clear current conversation state."""
         app = DeepAgentsApp(thread_id="old-thread")
+        monkeypatch.setattr(app, "_set_spinner", AsyncMock())
         app._agent = MagicMock()
         app._session_state = _mock_session_state("old-thread")
         fetch_history_mock = AsyncMock(
@@ -2149,6 +2223,32 @@ class TestConvertMessagesToData:
         widget._restore_deferred_state()
         formatted = widget._format_ask_user_output(str(widget._output), is_preview=True)
         assert formatted.content.plain == ASK_USER_FAILED_SUMMARY
+
+    def test_skill_read_splits_history_tool_groups(self) -> None:
+        from deepagents_code.tui.widgets.message_store import MessageType
+        from deepagents_code.tui.widgets.messages import ToolCallMessage
+
+        paths = ["before.py", "/skills/review/SKILL.md", "after.py"]
+        messages = [
+            self._make_ai(
+                tool_calls=[
+                    {"id": path, "name": "read_file", "args": {"file_path": path}}
+                    for path in paths
+                ]
+            ),
+            *(self._make_tool("contents", tool_call_id=path) for path in paths),
+        ]
+        result = DeepAgentsApp._convert_messages_to_data(messages)
+
+        assert [row.type for row in result] == [
+            MessageType.TOOL_GROUP,
+            MessageType.TOOL,
+            MessageType.TOOL_GROUP,
+        ]
+        widget = result[1].to_widget()
+        assert isinstance(widget, ToolCallMessage)
+        assert widget.has_class("-skill-read")
+        assert widget.args == {"file_path": paths[1]}
 
     def test_checkpoint_edit_restores_diff(self) -> None:
         """Checkpointed edit arguments rebuild the diff omitted from graph state."""

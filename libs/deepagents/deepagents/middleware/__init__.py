@@ -63,7 +63,7 @@ from deepagents.middleware.rubric import (
     RubricResult,
     RubricState,
 )
-from deepagents.middleware.skills import SkillMetadata, SkillsMiddleware, SkillsState
+from deepagents.middleware.skills import SkillMetadata, SkillsMiddleware, SkillsState, SkillToolResolver
 from deepagents.middleware.subagents import (
     CompiledSubAgent,
     SubAgent,
@@ -75,6 +75,7 @@ from deepagents.middleware.summarization import (
     SummarizationToolMiddleware,
     create_summarization_tool_middleware,
 )
+from deepagents.middleware.unsupported_content import UnsupportedContentMiddleware
 
 __all__ = [
     "DEEPAGENTS_DEFAULT_SUMMARY_PROMPT",
@@ -96,11 +97,13 @@ __all__ = [
     "RubricResult",
     "RubricState",
     "SkillMetadata",
+    "SkillToolResolver",
     "SkillsMiddleware",
     "SkillsState",
     "SubAgent",
     "SubAgentMiddleware",
     "SummarizationMiddleware",
     "SummarizationToolMiddleware",
+    "UnsupportedContentMiddleware",
     "create_summarization_tool_middleware",
 ]

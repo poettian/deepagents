@@ -2,6 +2,160 @@
 
 # Deep Agents Code Changelog
 
+## [0.1.83](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.82...deepagents-code==0.1.83) (2026-10-07)
+
+### Features
+
+- Recommend Haiku 5.5 for sidecar models.
+
+## [0.1.82](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.81...deepagents-code==0.1.82) (2026-10-07)
+
+### Features
+
+- Create persistent thread names automatically or on demand, and rename threads manually. ([#6715](https://github.com/langchain-ai/deepagents/pull/6715), [#6767](https://github.com/langchain-ai/deepagents/pull/6767))
+- Customize terminal tab titles. ([#6768](https://github.com/langchain-ai/deepagents/pull/6768))
+- Distinguish skill reads in the transcript. ([#6825](https://github.com/langchain-ai/deepagents/pull/6825))
+
+### Bug Fixes
+
+- Keep the thread picker open when ownership conflicts occur. ([#6824](https://github.com/langchain-ai/deepagents/pull/6824))
+- Preserve completion markers on remote messages. ([#6831](https://github.com/langchain-ai/deepagents/pull/6831))
+- Extend triple-click selection across blocks. ([#6819](https://github.com/langchain-ai/deepagents/pull/6819))
+- Recommend GPT-6 Luna for auto review. ([#6821](https://github.com/langchain-ai/deepagents/pull/6821))
+- Show editable install status in debug version information. ([#6797](https://github.com/langchain-ai/deepagents/pull/6797))
+
+## [0.1.81](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.80...deepagents-code==0.1.81) (2026-10-06)
+
+### Features
+
+- The agent can now discover marketplace plugins ([#6719](https://github.com/langchain-ai/deepagents/pull/6719)).
+- You can open the effort selector during active runs ([#6724](https://github.com/langchain-ai/deepagents/pull/6724)) and the cost breakdown from the footer ([#6723](https://github.com/langchain-ai/deepagents/pull/6723)).
+- Added `--no-tracing` and an explicit tracing status indicator ([#6721](https://github.com/langchain-ai/deepagents/pull/6721)).
+- Renamed `/summarization-model` to `/offload model` ([#6774](https://github.com/langchain-ai/deepagents/pull/6774)).
+- Highlighted the active line in multiline chat input ([#6746](https://github.com/langchain-ai/deepagents/pull/6746)).
+
+### Bug Fixes
+
+- Use `ChatBedrockConverse` for non-Anthropic Bedrock models ([#6718](https://github.com/langchain-ai/deepagents/pull/6718)).
+- Prevented concurrent writes to local threads ([#6717](https://github.com/langchain-ai/deepagents/pull/6717)).
+- Hook execution now fails closed if its context changes when a run resumes ([#6712](https://github.com/langchain-ai/deepagents/pull/6712)).
+- Improved server-side model catalog, selection, and interactive model metadata handling ([#6773](https://github.com/langchain-ai/deepagents/pull/6773), [#6772](https://github.com/langchain-ai/deepagents/pull/6772)).
+- Isolated stored provider endpoints in workspace models ([#6771](https://github.com/langchain-ai/deepagents/pull/6771)).
+- Reconciled cache expiry during model requests ([#6763](https://github.com/langchain-ai/deepagents/pull/6763)).
+- Preserved dispatch timers across interrupt replays ([#6722](https://github.com/langchain-ai/deepagents/pull/6722)).
+- Collapsed idle subagents and reopened them for new work ([#6782](https://github.com/langchain-ai/deepagents/pull/6782)).
+- Moved debug MCP server details into a modal ([#6720](https://github.com/langchain-ai/deepagents/pull/6720)).
+- Clarified that clearing the chat starts a new thread ([#6726](https://github.com/langchain-ai/deepagents/pull/6726)).
+
+## [0.1.80](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.79...deepagents-code==0.1.80) (2026-10-01)
+
+### Features
+
+- Emit a `cache_expiring` hook before the prompt cache expires ([#6638](https://github.com/langchain-ai/deepagents/pull/6638)).
+
+### Bug Fixes
+
+- Keep the transcript at its current position when opening pickers ([#6635](https://github.com/langchain-ai/deepagents/pull/6635)).
+- Share cache-expiring notifications with the TUI ([#6639](https://github.com/langchain-ai/deepagents/pull/6639)).
+- Use listed skill paths instead of inferring their locations ([#6711](https://github.com/langchain-ai/deepagents/pull/6711)).
+- Correct product and command names in skill guides ([#6637](https://github.com/langchain-ai/deepagents/pull/6637)).
+
+## [0.1.79](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.78...deepagents-code==0.1.79) (2026-09-29)
+
+### Bug Fixes
+
+- MCP tool calls now use configurable timeouts to prevent them from hanging indefinitely ([#6625](https://github.com/langchain-ai/deepagents/pull/6625)).
+- Stdio MCP servers now start in the session directory ([#6626](https://github.com/langchain-ai/deepagents/pull/6626)).
+- JavaScript subagent costs are preserved when resuming a session ([#6433](https://github.com/langchain-ai/deepagents/pull/6433)).
+- Thread switching now completes its preflight faster and shows progress sooner ([#6607](https://github.com/langchain-ai/deepagents/pull/6607)).
+- The `/effort` setting is now constrained for between-tools thinking ([#6630](https://github.com/langchain-ai/deepagents/pull/6630)).
+- CLI help now displays the same defaults used at runtime ([#6613](https://github.com/langchain-ai/deepagents/pull/6613)).
+- The incognito label now appears on the chat input border ([#6627](https://github.com/langchain-ai/deepagents/pull/6627)).
+
+## [0.1.78](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.77...deepagents-code==0.1.78) (2026-09-28)
+
+### Features
+
+- Ask isolated side questions with `/btw` ([#6434](https://github.com/langchain-ai/deepagents/pull/6434)).
+- Offer to summarize threads and switch when the cache expires ([#6477](https://github.com/langchain-ai/deepagents/pull/6477)).
+- Persist project MCP startup denials ([#6597](https://github.com/langchain-ai/deepagents/pull/6597)).
+
+### Bug Fixes
+
+- Show 100 recent threads by default ([#6604](https://github.com/langchain-ai/deepagents/pull/6604)).
+- Restore console input after piped prompts on Windows ([#6572](https://github.com/langchain-ai/deepagents/pull/6572)).
+- Load resumed conversation history on demand ([#6342](https://github.com/langchain-ai/deepagents/pull/6342)).
+
+## [0.1.77](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.76...deepagents-code==0.1.77) (2026-09-24)
+
+### Bug Fixes
+
+- Preview remote plugin contents before installation.
+- Report mis-encoded `config.toml` files created by older config writers.
+- Show how to cancel MCP browser login and handle Escape.
+- Make workspace configuration warnings actionable.
+- Hide prompt search hints when search is unavailable.
+
+## [0.1.76](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.75...deepagents-code==0.1.76) (2026-09-24)
+
+### Features
+
+- Label plugin servers in the MCP viewer ([#6539](https://github.com/langchain-ai/deepagents/pull/6539)).
+
+### Bug Fixes
+
+- Resolve plugin MCP servers during login ([#6524](https://github.com/langchain-ai/deepagents/pull/6524)).
+- Keep empty MCP servers searchable and include descriptions in search results ([#6540](https://github.com/langchain-ai/deepagents/pull/6540)).
+
+## [0.1.75](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.74...deepagents-code==0.1.75) (2026-09-23)
+
+### Bug Fixes
+
+- Lazy MCP caches now warm without blocking the event loop.
+- Token and cost breakdowns now refresh while the view is open.
+
+## [0.1.74](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.73...deepagents-code==0.1.74) (2026-09-23)
+
+### Features
+
+- Added inline thread mentions & picker via `@@` ([#6197](https://github.com/langchain-ai/deepagents/pull/6197)).
+- Usage summaries now show human invocations ([#6500](https://github.com/langchain-ai/deepagents/pull/6500)).
+
+### Bug Fixes
+
+- Retry bare `openai.APIError` exceptions raised mid-stream ([#6499](https://github.com/langchain-ai/deepagents/pull/6499)).
+- Keep prompt recall results out of the file picker ([#6494](https://github.com/langchain-ai/deepagents/pull/6494)).
+- Read `hooks.json` as UTF-8 in the legacy hook loader ([#6501](https://github.com/langchain-ai/deepagents/pull/6501)).
+
+### Performance Improvements
+
+- Reuse Auto classifier history ([#6056](https://github.com/langchain-ai/deepagents/pull/6056)).
+- Rank checkpoint and message row IDs before loading blobs and prompts ([#6488](https://github.com/langchain-ai/deepagents/pull/6488), [#6489](https://github.com/langchain-ai/deepagents/pull/6489)).
+- Log thread-loading phase timings ([#6490](https://github.com/langchain-ai/deepagents/pull/6490)).
+
+## [0.1.73](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.72...deepagents-code==0.1.73) (2026-09-22)
+
+### Features
+
+- Added cache bust timer to the footer. ([#6394](https://github.com/langchain-ai/deepagents/pull/6394))
+- Added a durable Debug Console cost breakdown. ([#6246](https://github.com/langchain-ai/deepagents/pull/6246))
+- Added support for copying the highlighted thread ID with `Ctrl+C`. ([#6431](https://github.com/langchain-ai/deepagents/pull/6431))
+
+### Bug Fixes
+
+- Improved cost-warning behavior by showing session cost warnings in a modal and suppressing historical cost warnings when resuming. ([#6393](https://github.com/langchain-ai/deepagents/pull/6393), [#6471](https://github.com/langchain-ai/deepagents/pull/6471))
+- Made thread browsing and resume flows more resilient with recoverable thread-picker resume failures, loading labels for thread details, and a clearer thread message count header. ([#6476](https://github.com/langchain-ai/deepagents/pull/6476), [#6430](https://github.com/langchain-ai/deepagents/pull/6430), [#6428](https://github.com/langchain-ai/deepagents/pull/6428))
+- Removed contradictory and invalid system-prompt instructions. ([#6072](https://github.com/langchain-ai/deepagents/pull/6072))
+- Preserved `ask_user` consent receipts across user turns and reconciled interrupted tool requests. ([#6307](https://github.com/langchain-ai/deepagents/pull/6307), [#6321](https://github.com/langchain-ai/deepagents/pull/6321))
+- Cleaned up newly created sandboxes when setup fails. ([#6475](https://github.com/langchain-ai/deepagents/pull/6475))
+- Fixed editable refreshes so they stay anchored to the correct checkout. ([#6455](https://github.com/langchain-ai/deepagents/pull/6455))
+- Kept installation locks outside the uv tool directory. ([#6472](https://github.com/langchain-ai/deepagents/pull/6472))
+- Improved workspace and runtime diagnostics, including separating access-policy compatibility from runtime identity. ([#6384](https://github.com/langchain-ai/deepagents/pull/6384), [#6386](https://github.com/langchain-ai/deepagents/pull/6386))
+- Deduplicated mixed-ID model usage. ([#6432](https://github.com/langchain-ai/deepagents/pull/6432))
+- Clarified the compaction prompt. ([#6429](https://github.com/langchain-ai/deepagents/pull/6429))
+- Restricted auto classifier IDs to the review batch enum. ([#6250](https://github.com/langchain-ai/deepagents/pull/6250))
+- Used UTF-8 for prompts and skill files. ([#6474](https://github.com/langchain-ai/deepagents/pull/6474))
+
 ## [0.1.72](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.71...deepagents-code==0.1.72) (2026-09-21)
 
 ### Features

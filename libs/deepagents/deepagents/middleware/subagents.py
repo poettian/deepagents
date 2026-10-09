@@ -4,7 +4,7 @@ import contextlib
 import dataclasses
 import json
 from collections.abc import Awaitable, Callable, Generator, Sequence
-from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired, TypedDict, cast
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware, InterruptOnConfig
@@ -27,10 +27,11 @@ from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import StructuredTool
 from langgraph.types import Command
 from langsmith.run_helpers import get_tracing_context, tracing_context
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from typing_extensions import TypeIs
 
 from deepagents.backends.protocol import BackendProtocol
+from deepagents.middleware._skill_tools import _SKILL_TOOLS_DISCLOSED_KEY
 from deepagents.middleware._utils import append_to_system_message
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
 from deepagents.middleware.summarization import (
@@ -39,16 +40,24 @@ from deepagents.middleware.summarization import (
     SummarizationEvent,
     _DeepAgentsSummarizationMiddleware,
 )
+from deepagents.middleware.unsupported_content import UnsupportedContentMiddleware
+
+if TYPE_CHECKING:
+    from pydantic_core import InitErrorDetails
 
 SUBAGENT_RESPONSE_FORMAT_CONFIG_KEY = "__deepagents_subagent_response_format"
 """Configurable key used by task-tool callers to request dynamic response format."""
 
-_FORK_EXCLUDED_STATE_KEYS = frozenset({"structured_response", SUMMARIZATION_EVENT_KEY, SUMMARIZATION_SESSION_ID_KEY})
+_FORK_EXCLUDED_STATE_KEYS = frozenset(
+    {"structured_response", "pinned_skills", SUMMARIZATION_EVENT_KEY, SUMMARIZATION_SESSION_ID_KEY, _SKILL_TOOLS_DISCLOSED_KEY}
+)
 """State a fork must not resume.
 
 The summarization event is folded into the fork's messages instead. Dropping the
 session ID lets the subagent generate its own, and dropping a prior structured response
-ensures it cannot be mistaken for the fork's result.
+ensures it cannot be mistaken for the fork's result. The disclosed skill tools
+describe the parent's last model call; the fork records its own. Skills the parent
+has yet to pin are the parent's own.
 """
 
 _FORKED_CONTEXT_KEY = "_deepagents_forked_context"
@@ -78,60 +87,23 @@ class SubAgent(TypedDict):
     a default middleware stack before any custom `middleware` specified in
     this spec.
 
-    Required fields:
-        name: Unique identifier for the subagent.
-
-            The main agent uses this name when calling the `task()` tool.
-        description: What this subagent does.
-
-            Be specific and action-oriented. The main agent uses this
-            to decide when to delegate.
-    Optional fields:
-        system_prompt: Instructions for the subagent.
-
-            Appended to the inherited prompt under `mode="fork"`.
-        mode: `isolated` (default) for a subagent that only sees the
-            delegated task, or `fork` to continue the parent's conversation.
-        tools: Tools the subagent can use.
-
-            If not specified, inherits tools from the main agent
-            via `default_tools`.
-        model: Override the main agent's model.
-
-            Use the format `'provider:model-name'` (e.g., `'openai:gpt-5.5'`).
-        middleware: Additional middleware for custom behavior, logging,
-            or rate limiting. To restrict filesystem tools, include a
-            `FilesystemMiddleware(tools=...)` instance here — it
-            will be used as the subagent's filesystem middleware instead of
-            the default one.
-        interrupt_on: Configure human-in-the-loop for specific tools.
-
-            Requires a checkpointer.
-        skills: Skill source paths for `SkillsMiddleware`.
-
-            List of paths to skill directories
-            (e.g., `["/skills/user/", "/skills/project/"]`).
-        permissions: Filesystem permission rules for this subagent.
-
-            If omitted, inherits the parent agent's permissions. If provided,
-            replaces the parent agent's rules entirely for this subagent.
-
-            Rules are evaluated in declaration order; the first match wins.
+    `name` and `description` are required; all other fields are optional.
+    See the individual attributes for configuration details.
     """
 
     name: str
-    """Unique identifier for the subagent."""
+    """Unique identifier used by the main agent when calling the `task()` tool."""
 
     description: str
     """What this subagent does.
 
-    The main agent uses this to decide when to delegate.
+    Be specific and action-oriented: the main agent uses this to decide when to delegate.
     """
 
     tools: NotRequired[Sequence[BaseTool | Callable | dict[str, Any]]]
     """Tools the subagent can use.
 
-    If not specified, inherits from main agent.
+    If not specified, inherits tools from the main agent via `default_tools`.
     """
 
     model: NotRequired[str | BaseChatModel]
@@ -141,13 +113,20 @@ class SubAgent(TypedDict):
     """
 
     middleware: NotRequired[list[AgentMiddleware]]
-    """Additional middleware for custom behavior."""
+    """Additional middleware for custom behavior, logging, or rate limiting.
+
+    To restrict filesystem tools, include a `FilesystemMiddleware(tools=...)`
+    instance here to replace the subagent's default filesystem middleware.
+    """
 
     interrupt_on: NotRequired[dict[str, bool | InterruptOnConfig]]
-    """Configure human-in-the-loop for specific tools."""
+    """Configure human-in-the-loop for specific tools. Requires a checkpointer."""
 
     skills: NotRequired[list[str]]
-    """Skill source paths for `SkillsMiddleware`. Forbidden under `mode="fork"`."""
+    """Skill source paths for `SkillsMiddleware`. Forbidden under `mode="fork"`.
+
+    For example, `["/skills/user/", "/skills/project/"]`.
+    """
 
     permissions: NotRequired[list[FilesystemPermission]]
     """List of `FilesystemPermission` rules for this subagent.
@@ -394,6 +373,8 @@ _EXCLUDED_STATE_KEYS = {
     "todos",
     "structured_response",
     "skills_metadata",
+    "pinned_skills",
+    _SKILL_TOOLS_DISCLOSED_KEY,
     _FORKED_CONTEXT_KEY,
 }
 """State keys that are excluded when passing state to subagents and when
@@ -408,10 +389,16 @@ When returning updates:
     to the main agent.
 3. `skills_metadata` is excluded so a subagent loads skills from its own
     sources rather than reusing the parent's list, and cannot replace the
-    parent's list with its own.
+    parent's list with its own. `_skill_tools_disclosed` is excluded because it
+    describes one agent's latest model call, and `pinned_skills` because a
+    pending pin belongs to the agent it was requested for.
 4. Agent-private fields on middleware state schemas are excluded from both
     subagent output and subagent inputs.
 """
+
+
+_TASK_TOOL_INJECTED_ARGS = frozenset({"runtime"})
+"""Arguments the tool node injects into the `task` call alongside the model's."""
 
 
 class TaskToolSchema(BaseModel):
@@ -425,6 +412,31 @@ class TaskToolSchema(BaseModel):
     )
 
     subagent_type: str = Field(description=("The type of subagent to use. Must be one of the available agent types listed in the tool description."))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_unknown_keys(cls, data: object) -> object:
+        """Refuse keys the schema does not define.
+
+        Models sometimes put the real instructions under an invented key (e.g.
+        `prompt`) and leave a short label in `description`. Ignoring the extra key
+        dispatched the subagent with the label alone and reported success; a
+        validation error goes back to the model as a tool error naming the key.
+
+        `extra="forbid"` cannot be used: the tool node validates the arguments
+        after injecting the `runtime` parameter, which is not a schema field.
+        """
+        if isinstance(data, dict):
+            arguments = {str(key): value for key, value in data.items()}
+            unknown = sorted(arguments.keys() - set(cls.model_fields) - _TASK_TOOL_INJECTED_ARGS)
+            if unknown:
+                # LangGraph filters out errors without a field location.
+                errors: list[InitErrorDetails] = []
+                for key in unknown:
+                    msg = f"Unexpected argument {key!r}; put all instructions for the subagent in `description`."
+                    errors.append({"type": "value_error", "loc": (key,), "input": arguments[key], "ctx": {"error": ValueError(msg)}})
+                raise ValidationError.from_exception_data(cls.__name__, errors)
+        return data
 
 
 TASK_TOOL_DESCRIPTION = """Launch an ephemeral subagent to handle a complex, multi-step task.
@@ -549,6 +561,9 @@ def create_sub_agent(
     interrupt_on = spec.get("interrupt_on")
     if interrupt_on:
         middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
+
+    if not any(m.name == UnsupportedContentMiddleware.__name__ for m in middleware):
+        middleware.append(UnsupportedContentMiddleware())
 
     selected_response_format = response_format if response_format is not None else spec.get("response_format")
     create_agent_kwargs: dict[str, Any] = {

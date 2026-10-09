@@ -1,6 +1,5 @@
 # Files
 
-- [Cost, Usage, and Session Operations](cost-and-sessions.md) - Operate dcode session persistence, replay-safe usage displays, and estimated model-cost accounting. Covers offline price catalogs and overrides, server offload settlement, and diagnostics that distinguish estimates from provider billing.
-- [Development, CI, and Releases](development.md) - Package-local development and aggregate lock validation for the Deep Agents Python monorepo, plus independently versioned release-please and PyPI releases.
-- [OpenWiki Update Automation Runbook](openwiki-automation.md) - Operate and troubleshoot the scheduled or manually dispatched OpenWiki refresh, from uncredentialed generation through restricted publication, pull-request reconciliation, and pinned merge retries.
-- [Security Boundaries and Secrets](security.md) - Operating guidance for agent authority, filesystem and execution boundaries, MCP credentials, Talon approvals, and GitHub Actions secrets. It distinguishes mediated controls from containment and explains the restricted OpenWiki publication path.
+- [Cost Tracking and Session Operations](cost-and-sessions.md) - Operate dcode's checkpointed estimated-cost accounting, isolated side-task subtotals, pricing catalog behavior, and SQLite session lifecycle. Covers cost diagnostics, remote presentation, safe local inspection, thread ownership, and server-side offload settlement.
+- [Development, Dependencies, and Releases](development.md) - Package-scoped uv and Make workflows, lockfile discipline, dependency-floor automation, and the release-please-to-PyPI release lifecycle for the Deep Agents monorepo.
+- [Security and Operational Boundaries](security.md) - Trust model and enforceable operational boundaries for Deep Agents and Deep Agents Code, including filesystem tools, approvals, configuration, MCP, credentials, workspaces, and untrusted inputs.

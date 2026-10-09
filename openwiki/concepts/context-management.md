@@ -1,134 +1,162 @@
 ---
 type: context-management concept
-title: Context Management and Offloading
-description: How Deep Agents and dcode reduce model-visible context through recoverable result eviction, summary events, overflow recovery, and server-owned offload. Covers storage, state effects, concurrency, and safe operational changes.
-tags: [context-management, summarization, compaction, eviction, offload, middleware, conversation-history]
+title: Context Management
+description: Deep Agents keeps model requests usable with recoverable eviction, summaries, memory injection, prompt caching, and bounded overflow recovery. Dcode adds a server-owned offload protocol with transactional archive handling and cancellation-aware remote recovery.
+tags: [context-management, eviction, summarization, offload, memory, prompt-caching, middleware]
 verified:
   - by: openwiki/0.4.2
-    at: 2026-09-18T16:46:37.183Z
+    at: 2026-10-08T08:07:53.482Z
 sources:
-  - id: openwiki-source-05106e66a949150d557266a2
-    resource: repo://libs/code/deepagents_code/agent.py
+  - id: openwiki-source-b7d66cbdbe9dae9f133a7c5e
+    resource: repo://libs/code/deepagents_code/client/remote_client.py
   - id: openwiki-source-ea1089f0d7536fbc96c64866
     resource: repo://libs/code/deepagents_code/offload_api.py
   - id: openwiki-source-c100a7d2ff8c43af8ad1b816
     resource: repo://libs/code/deepagents_code/offload_middleware.py
   - id: openwiki-source-9b6cab59e92c8914079f0f53
     resource: repo://libs/code/deepagents_code/offload.py
-  - id: openwiki-source-6e002fd7a8a5dcb5186cae05
-    resource: repo://libs/code/tests/integration_tests/test_compact_resume.py
-  - id: openwiki-source-71b99fa3b7baf6ea6b10c6fc
-    resource: repo://libs/code/tests/integration_tests/test_offload_server_side.py
-  - id: openwiki-source-6a586415ef68cbe7c7967a41
-    resource: repo://libs/code/tests/unit_tests/test_offload_api.py
+  - id: openwiki-source-a1549ea98d425efea270be93
+    resource: repo://libs/deepagents/deepagents/backends/composite.py
+  - id: openwiki-source-0fc0e47059e4d07e23e50be2
+    resource: repo://libs/deepagents/deepagents/graph.py
   - id: openwiki-source-9841bc6daf811e4615c54a88
     resource: repo://libs/deepagents/deepagents/middleware/_message_eviction.py
   - id: openwiki-source-64b92f60456305edc143f48a
     resource: repo://libs/deepagents/deepagents/middleware/_overflow_clip.py
+  - id: openwiki-source-7a16b9a53a07e882b7305459
+    resource: repo://libs/deepagents/deepagents/middleware/_prompt_caching.py
   - id: openwiki-source-fed4b84a38685f37e58018c5
     resource: repo://libs/deepagents/deepagents/middleware/filesystem.py
+  - id: openwiki-source-46a23efe78a78f9b3cd75d00
+    resource: repo://libs/deepagents/deepagents/middleware/memory.py
   - id: openwiki-source-f763e99e439a1356866a7aa4
     resource: repo://libs/deepagents/deepagents/middleware/summarization.py
-generated: { by: "openwiki/0.4.2", at: "2026-09-18T16:46:37.183Z" }
+  - id: openwiki-source-837c84a3f3120bc778033547
+    resource: repo://libs/deepagents/deepagents/middleware/unsupported_content.py
+  - id: openwiki-source-6228ff9cf1d681a771797121
+    resource: repo://libs/deepagents/tests/unit_tests/middleware/test_compaction_recovery.py
+  - id: openwiki-source-f445d59792df76394a37a768
+    resource: repo://libs/deepagents/tests/unit_tests/test_artifacts_root.py
+  - id: openwiki-source-10e4084b6aa57e5cc82620b3
+    resource: repo://libs/deepagents/tests/unit_tests/test_end_to_end.py
+generated: { by: "openwiki/0.4.2", at: "2026-10-08T08:07:53.482Z" }
 ---
 
-# Context Management and Offloading
+# Context Management
 
-Long-running threads face two different pressures: a single tool result can be too large to keep in a request, and accumulated messages plus system prompt, tool schemas, and output reservation can exceed the model input budget. Deep Agents addresses them with **result eviction**, **summarization events**, and a one-retry overflow recovery. dcode layers policy hooks and a server-owned `/offload` operation on that mechanism.
+Long-running agents have two different context pressures: a single message or tool result can be too large, and accumulated history can exceed a model's input budget. Deep Agents addresses these at model-request boundaries without treating the checkpointed conversation as disposable:
 
-These mechanisms primarily change the **effective messages sent to the model**. SDK summarization retains raw `messages` and records `_summarization_event` and `_summarization_session_id`; the event reconstructs a summary plus the retained suffix on later calls. This is distinct from durable memory files and checkpoint lifecycle; see [State Persistence](/openwiki/concepts/state-persistence.md) and [Runtime Behavior](/openwiki/architecture/runtime-behavior.md).
+- `FilesystemMiddleware` offloads oversized tool results and makes large human input model-visible as a recoverable preview.
+- `SummarizationMiddleware` retains raw messages and records a summary event that reconstructs the effective conversation from a summary and retained suffix.
+- `MemoryMiddleware` loads durable `AGENTS.md` context into the system prompt, while provider prompt-caching middleware makes stable prompt prefixes reusable.
+- A known-over-budget request or recognized provider context overflow gets at most one strictly smaller recovery request.
+- In dcode, `/offload` is a server-owned, checkpoint-aware compaction operation, rather than a client-side message rewrite.
 
-```mermaid
-flowchart TD
-    Tool["Tool result"] --> Large{"Result exceeds eviction budget"}
-    Large -->|Yes| Artifact["Write artifact and replace text with preview"]
-    Large -->|No| Stored["Keep result"]
-    Request["Prepare effective request"] --> Trigger{"Trigger or input budget exceeded"}
-    Trigger -->|No| Model["Call model"]
-    Trigger -->|Yes| Partition["Partition old and retained messages"]
-    Partition --> Archive["Archive old messages"]
-    Archive --> Summary["Create summary event"]
-    Summary --> Model
-    Model -->|Recognized context error| Recover["Compact and make one smaller retry"]
-    Recover --> Model
-    Artifact --> Read["Recover selected ranges with read_file"]
-```
-
-Caption: Result eviction is independent of conversation compaction; compaction preserves raw messages while changing the model-visible history.
-
-## Result eviction and recovery paths
-
-`FilesystemMiddleware` proactively offloads oversized tool-result text through the shared helper. It writes extracted text to `{large_tool_results_prefix}/{sanitized_tool_call_id}` and replaces text with `TOO_LARGE_TOOL_MSG`: a line-numbered head-and-tail preview that tells the model to call `read_file` with `offset` and `limit`. A failed backend write returns no replacement, so the original result remains. The replacement preserves `tool_call_id`, message id, metadata, artifact, status, and non-text content blocks; an image or other media remains model-visible.
-
-The summarizer uses `CompositeBackend.artifacts_root` when available, producing paths under its artifact root; a non-composite backend uses `/conversation_history` and `/large_tool_results`. A displayed path is useful only when the same backend exposed to `read_file` can resolve it. See [Tools and Filesystem](/openwiki/concepts/tools-filesystem.md).
-
-## SDK compaction and recovery
-
-`SummarizationMiddleware.wrap_model_call` first reconstructs the effective messages from the prior event, counts messages together with system prompt and tools, and optionally truncates old `write_file` and `edit_file` arguments. It summarizes when its configured trigger fires **or** the measured request is already above the calculated input budget. A trigger can be a size tuple, an ANDed dictionary clause, or ORed clauses; `keep` determines the retained suffix.
-
-For a positive cutoff, it partitions messages, rewrites inline data media, archives the old partition, creates an LLM summary, and calls the model with summary plus retained messages. Its `Command` writes the summary event and session id; it writes replacement tail messages only when overflow clipping produced replacements. A summary archive failure warns and leaves `file_path=None`, but does not discard a usable in-context summary.
-
-Provider recovery is intentionally bounded. In addition to `ContextOverflowError`, the middleware recognizes context-limit wording in 400, 413, and 422 errors, but does not retry unrelated bad requests. It attempts normal execution when compaction is not indicated, then falls back to compaction on a recognized context error. It rejects a known over-budget reduced request and never sends an unchanged rejected request; after recovery it permits at most one strictly smaller retry, otherwise raises `ContextOverflowError` with the original provider error as cause.
-
-### Archive, media, and session lifecycle
-
-Each summarization session appends XML-rendered old messages to one markdown file, `{artifacts_root}/conversation_history/{session_id}.md`, under a timestamped `## Summarized at` heading. Earlier summary messages are filtered from subsequent archive sections. The session id is reused from state or generated as `session_<uuid>`, then persisted so later turns append to the same file.
-
-Before both archive rendering and summary generation, inline `data:` media is uploaded under `conversation_history/media` and replaced by typed path references. Content-hash deduplication avoids repeated uploads. Decode or upload failure becomes a failed-offload placeholder; if the archive itself succeeds, the middleware warns that the original media cannot be recovered.
-
-### Tail clipping after pressure
-
-The overflow fallback can reduce a trailing consecutive batch of `ToolMessage` values. The helper’s threshold derives from `keep` (tokens, a fraction of a known model limit, or a 5,000-token fallback), but the SDK budget-retry path invokes it with `keep=("tokens", 1)` whenever it must make the recovery request. Generic tool results are persisted through the eviction helper. For a `read_file` result, clipping instead retains about 4,000 leading characters and points to the already-existing source path, avoiding a redundant write. Replacement messages retain ids so the messages reducer overwrites their checkpoint entries; failed writes leave originals unchanged.
-
-## dcode: policy-aware compaction and `/offload`
-
-`CLICompactionMiddleware` exposes model-initiated `compact_conversation` and runs `PreCompact` before automatic threshold compaction and overflow recovery. A denied threshold compaction falls through to the normal call. If a provider has already returned `ContextOverflowError` and the gate blocks recovery, dcode re-raises that overflow rather than proceed without the required reduction. Async automatic and model-initiated archive updates use a process-local asyncio lock keyed by summarization session to serialize the archive read-append-rewrite cycle.
-
-`OffloadOperation` is the server-side forced form. It reads hydrated checkpoint state, applies any existing event to calculate effective history, dispatches a synthetic forced `compact_conversation` through `PreCompact` and `PreToolUse`, and plans a summary update. Hook interrupts return to the client with no state write. A resume request re-executes the operation from the beginning with accumulated hook responses; the forced call id derives from that attempt’s checkpoint namespace, so it is stable across resume rounds and changes between attempts. A missing hook-outcome channel fails closed.
+Filesystem artifacts are part of the context contract: an advertised path must resolve through the configured backend's `read_file` tool. See [State Persistence](/openwiki/concepts/state-persistence.md), [Runtime Behavior](/openwiki/architecture/runtime-behavior.md), [Cost and Sessions](/openwiki/operations/cost-and-sessions.md), and [Run a dcode Session](/openwiki/workflows/run-dcode-session.md).
 
 ```mermaid
 flowchart TD
-    Start["POST offload"] --> Ready{"Idle or error thread with no graph work"}
-    Ready -->|No| Conflict["409 and no commit"]
-    Ready -->|Yes| Hydrate["Read checkpoint and hydrate messages"]
-    Hydrate --> Hooks{"Hooks interrupt or deny"}
-    Hooks -->|Interrupt| Resume["Return request for client response"]
-    Hooks -->|Deny| Denied["Return unchanged result"]
-    Hooks -->|Allow| Plan["Plan summary and pending archive"]
-    Plan --> Check{"Checkpoint still unchanged"}
-    Check -->|No| Conflict
-    Check -->|Yes| Reserve["Commit permitted summary and cost channels"]
-    Reserve --> Append["Append archive under session lock"]
-    Append --> Link["Commit archive path"]
-    Link -->|Absent| Rollback["Restore prior archive snapshot"]
-    Link -->|Unreadable| Unknown["Return indeterminate error"]
-    Link -->|Present| Done["Return compacted result"]
+    Result["Tool result"] --> ResultLimit{"Over eviction limit"}
+    ResultLimit -->|No| KeepResult["Keep tool message"]
+    ResultLimit -->|Yes| StoreResult["Write complete text"]
+    StoreResult -->|Write fails| KeepResult
+    StoreResult -->|Write succeeds| ResultStub["Pointer and preview"]
+    Request["Model request"] --> Effective["Apply summary event"]
+    Effective --> Budget{"Trigger or budget exceeded"}
+    Budget -->|Yes| Compact["Archive and summarize"]
+    Budget -->|No| Memory["Inject memory and cache markers"]
+    Compact --> Memory
+    Memory --> Model["Call model"]
+    Model -->|Context overflow| Clip["Clip trailing tool batch"]
+    Clip --> Retry["One smaller retry"]
+    ResultStub --> Recover["read_file"]
 ```
 
-Caption: Server offload reserves checkpoint state before its archive side effect and checks that the resulting archive link landed.
+Caption: result eviction makes individual content recoverable, whereas compaction changes the effective model history while preserving raw checkpoint messages.
 
-### HTTP boundary, state, and failure semantics
+## Artifact roots and proactive eviction
 
-The endpoint obtains `thread_id` from the URL and requires a non-empty `operation_id`, context, and hook-response mapping. It permits only idle or error-status threads, rejects pending graph work, serializes a thread locally, and rereads checkpoint identity before commit. An `(thread_id, operation_id)` registry rejects duplicate active and remembered terminal attempts; the cancellation endpoint cancels an active operation and waits for a terminal result.
+`CompositeBackend` defaults `artifacts_root` to `/`, routes by longest matching prefix, and preserves the public full path while delegating a stripped path to the selected backend. `FilesystemMiddleware` derives large-result and conversation-history locations below that root when it is available, otherwise at root-level paths. Route the chosen artifact root to storage exposed by `read_file`; changing only the root can make a model-visible recovery pointer unusable.
 
-The route is deliberately not a message-rewrite API. `OffloadStateUpdate` permits only `_summarization_event`, `_summarization_session_id`, and `_session_cost_usd`; a runtime allowlist rejects `messages` or any future unapproved channel. If the checkpoint advanced while the summary model was running, no offload state is committed. This prevents overwriting a concurrent turn, though the discarded summary work can still have incurred model cost.
+| Artifact | Path below effective root | Producer |
+| --- | --- | --- |
+| Generic large tool result | `large_tool_results/{sanitized-tool-call-id}` | eviction or overflow clipping |
+| Large human input | `conversation_history/{uuid}.md` | `FilesystemMiddleware` |
+| Archived conversation | `conversation_history/session_{uuid}.md` | summarization |
+| Offloaded media | `conversation_history/media/{sha256-prefix}.{ext}` | summarization |
 
-For an archive-bearing plan, `_PendingArchive` snapshots the prior archive and is written only after the summary reservation commits. The follow-up event update links the path. If that update is confirmed absent, `_ArchiveAppend.rollback` restores the exact previous content or removes a newly created file; if its outcome cannot be read back, the operation reports an indeterminate error rather than success. Cancellation waits for the deferred settlement task, then re-raises the original cancellation.
+`FilesystemMiddleware` proactively evicts only text exceeding its configured character-derived threshold. It writes the complete content under a sanitized tool-call path and substitutes a pointer and preview only after a successful backend write; failure leaves the original message intact. The replacement preserves `ToolMessage` identity and non-text blocks. Its text preview is a line-numbered head-and-tail view that distinguishes omitted middle lines from individually clipped long lines.
 
-Model selection is server-owned at this HTTP trust boundary. Client-supplied model, `model_params`, and `summarization_model` are discarded; trusted main-model settings are restored from checkpoint when present, while the summary model uses server launch configuration. Transport, proxy, client, and header parameters are stripped so a client cannot redirect a credentialed summary request to a chosen endpoint.
+Large human messages deliberately follow another ownership model. Full content remains in checkpoint state, but successful offload tags the same-id `HumanMessage` with `lc_evicted_to` and replaces it with a preview only in model requests. A same-id update avoids overwriting an AI response from the same graph step. If the write fails, the message is neither tagged nor truncated. These behavior paths have equivalent sync and async semantics using `write`/`awrite`.
 
-The agent publishes its `OffloadOperation` on the same `CompositeBackend` used by compaction; attachment rejects a summarizer bound to another backend. This makes the archive pointer returned by compaction recoverable through the agent’s own filesystem tools. Server integration tests cover a forced cutoff advance without replacing checkpointed messages, archive reading through `read_file`, concurrent-turn preservation, and restart/resume with a client that owns no backend.
+## Summary events, media, and overflow recovery
 
-## Local storage and operational controls
+`SummarizationMiddleware` does not delete raw history. `_summarization_event` stores a cutoff, a summary message, and optionally an archive path; model-visible messages are reconstructed from that summary and the retained raw suffix. The persisted `_summarization_session_id` names the per-session archive so later compactions append to it.
 
-In local mode, conversation archives are kept in `DEEPAGENTS_HOME` (default `~/.deepagents`) under `conversation_history`. If this cannot be created or written, dcode falls back to private temporary storage and reports the condition through `offload_storage_is_ephemeral`; such history may not survive restart. The dedicated archive directory is ownership-checked and hardened to `0o700`, while the shared profile root’s permissions are left unchanged.
+Before archival and summary generation, inline `data:` media is uploaded once by content hash below `conversation_history/media` and rewritten to path references. Decode or upload failures become explicit failed-offload placeholders, not silent omissions. Older non-summary messages are then rendered into timestamped Markdown history. Archive writes are best effort: summary compaction remains useful in context even when `file_path` is absent, but the old material is not storage-recoverable.
 
-Large tool-result artifacts normally use a hardened per-user temporary directory. If that predictable location is unavailable, dcode exposes `/dcode-artifacts-fallback` and routes it to a private unique directory, retaining a stable model-visible prefix. `sweep_offloaded_history` applies `history.retention_days` to local markdown archives; zero disables sweeping, and the deletion path rechecks an open regular-file descriptor immediately before unlinking to avoid deleting an archive concurrently refreshed by compaction. `delete_offloaded_history` is best-effort local cleanup, rejects path-escaping thread ids, and does not delete sandbox- or server-owned archives.
+Compaction counts the entire request, including system prompt and, where the counter supports it, tool schemas. It runs when the configured trigger fires or the calculated input budget is exceeded; `keep` controls the raw suffix. Automatic and explicit `compact_conversation` use the same summary-event/session-id representation, so manual compaction is an extension point rather than a competing history format.
 
-## Safe changes checklist
+If a provider returns a recognized context-limit failure, recovery only clips a trailing consecutive `ToolMessage` batch, preserving tool-call/result ordering. A `read_file` result retains a short leading excerpt and points to its original source path; generic tool output is persisted with normal large-result eviction. Unrelated bad requests are not reclassified as overflow. The retry is bounded to one request that is strictly smaller than the failed request and, when known, within budget; exhausted recovery raises `ContextOverflowError`.
 
-- **Preserve recovery:** alter trigger/keep logic only with tests that prove the reduced request is smaller, valid tool-call/result pairs remain intact, and irreducible system/tool/output overhead never reaches the provider.
-- **Preserve artifact routing:** changing `artifacts_root`, archive names, or fallback routes requires validating `read_file` against every backend that can receive the pointer.
-- **Treat archive failure separately from summary failure:** SDK compaction may continue without an archive; server offload has ordered reservation, append, verification, and rollback semantics that must not be collapsed into one write.
-- **Keep the HTTP allowlist and model trust boundary:** do not permit `messages` writes or client-selected model transport in `/offload` without reworking concurrency and credential-threat assumptions.
-- **Test both sync and async paths:** recovery and eviction have separate sync/async implementations; dcode’s archive serialization specifically applies to asynchronous paths.
+`UnsupportedContentMiddleware` is request-local capability filtering, not offload. It substitutes unsupported image, audio, video, and file blocks only in `HumanMessage` and `ToolMessage` model requests, leaving original graph state intact for a later capable model.
+
+## Persistent memory and prompt caching
+
+`MemoryMiddleware` loads configured `AGENTS.md` sources once per agent state, storing path-to-content in private `memory_contents`. Missing sources are ignored, but other download errors fail loading. At request time, configured sources are concatenated in source order, HTML comments are stripped, and the result is appended to the system prompt. Memory is reference material rather than trusted hidden instructions: its injected guidelines direct the agent to prefer explicit user requests and verified tool evidence when they conflict.
+
+The middleware can use `system_prompt=None` to load state without injection. On an active `ChatAnthropic` request, `add_cache_control=True` tags the final system content block with ephemeral cache control. This second boundary keeps the memory portion cacheable independently from the static prompt. Graph construction appends provider-specific caching middleware for Anthropic and, when installed, Bedrock and Fireworks, then adds memory after it; memory's boundary follows runtime model selection and is a no-op for non-Anthropic wrappers.
+
+## Dcode server-owned offload
+
+Dcode turns manual offload into an HTTP operation over server-read checkpoint state. Agent construction creates a composite backend, routes `conversation_history` to local private storage in local mode, creates `CLICompactionMiddleware`, and publishes an `OffloadOperation` on that same backend. The operation uses the agent's existing compaction and hook policy, but its allowed update type excludes `messages`.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as Offload API
+    participant Hooks
+    participant Store as Checkpoint Store
+    participant Archive
+    Client->>API: offload operation id and context
+    API->>Store: verify idle state and read checkpoint
+    API->>Hooks: request compaction decision
+    Hooks-->>API: complete or interrupt
+    API-->>Client: hook request when needed
+    Client->>API: resume with hook response
+    API->>Store: reserve summary event and cost
+    API->>Archive: append transcript
+    API->>Store: link archive path
+    API-->>Client: typed result
+```
+
+Caption: a server operation re-executes for hook resumes, commits only after checkpoint checks, and links an archive after reserving the summary state.
+
+`RemoteAgent.aoffload` ensures a remote thread exists, mints one `operation_id`, and posts it repeatedly while fulfilling hook interrupts. The operation id is retained across rounds so the forced compaction call id and hook invocation remain stable; a 32-fulfillment limit prevents an unbounded transport loop. It validates completed result fields before callers render them.
+
+The server serializes each thread operation, refuses active/interrupted threads or pending graph work, reads the checkpoint itself, and rechecks the checkpoint id before commit. It trusts checkpointed main-model settings rather than client-supplied model and summarization overrides. A handoff summarizes all source messages for a new thread and saves a recovery transcript, but does not write a summary event to the source thread.
+
+For normal offload, commit first reserves the summary event and cost state, then appends the archive under its session lock, and finally links the archive path. The archive helper refuses a truncating write after a non-not-found prerequisite read error. If linking demonstrably fails, it rolls back the archive append; if link status cannot be determined, it reports an indeterminate operation instead of asserting safe recovery. If a checkpoint write is uncertain after a thread advance, cost records remain claimed to avoid double charging and the user must inspect context before retrying.
+
+### Local storage and lifecycle
+
+In local mode, conversation history prefers `~/.deepagents/conversation_history`, creates and hardens its dedicated directory to `0o700`, verifies it is writable, and marks the storage ephemeral when it must fall back to a private temporary location. Startup retention sweeps only expired regular Markdown archives and treats failure as best effort. Thread deletion removes the per-thread archive and handoff snapshots, refuses suspicious path-escaping ids, and never blocks deletion on cleanup failure.
+
+### Cancellation and remote recovery
+
+Cancelling an in-flight client offload is not merely local task cancellation. `RemoteAgent` posts an operation-specific cancel request and defers repeated caller cancellation until the server acknowledges `cancelled` or `finished`, with a ten-second bound. The server cancels the active task and waits for its terminal outcome. Commit settlement similarly runs a started commit to completion before re-raising cancellation, avoiding a half-settled operation.
+
+Separately, remote state recovery handles a 409 update conflict by concurrently cancelling pending and running server runs, waiting at most ten seconds per run, and retrying the update once. `aabandon_pending_work` closes only unanswered tool calls in the trailing turn with error `ToolMessage`s before clearing graph work; this preserves the provider-required adjacency of tool uses and results. A remaining pending snapshot is terminally reported rather than silently ignored.
+
+## Operational invariants and focused tests
+
+When changing this subsystem:
+
+1. Never emit a recovery pointer until its write succeeds, and keep `read_file`, artifact root, and backend routing aligned.
+2. Preserve message ids and trailing tool-call/result ordering; do not broaden overflow clipping.
+3. Treat a summary with no archive as valid but not storage-recoverable.
+4. Keep server `/offload` from writing `messages`, and revalidate checkpoint identity before state commit.
+5. Maintain stable per-attempt hook identities across resume rounds and confirm server cancellation before abandoning a client operation.
+6. Tune eviction limits, summarization trigger/`keep`, output reservation, memory size, and provider cache boundaries together: every injected system block consumes budget even if cached.
+
+Focused tests cover artifact-root normalization in sync and async paths, successful-write-only eviction, mixed content and metadata preservation, media/archive failures, `read_file` clipping without duplicate artifacts, strict single-retry overflow recovery, and manual compaction state reuse. Memory tests cover ordered loading, comment stripping, request-only injection, error propagation, and Anthropic cache markers. For dcode, test the HTTP offload protocol, hook resume identity, checkpoint conflicts, archive rollback/link uncertainty, cancellation acknowledgement, and remote state-conflict recovery.

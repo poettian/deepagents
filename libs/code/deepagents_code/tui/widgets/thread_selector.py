@@ -54,7 +54,7 @@ _URL_FETCH_TIMEOUT = 2.0
 
 _column_widths_cache: (
     tuple[
-        tuple[tuple[str, str | None], ...],  # (thread_id, checkpoint_id) fingerprint
+        tuple[tuple[str, str | None, str | None], ...],
         frozenset[str],  # visible column keys
         bool,  # relative_time
         dict[str, int | None],  # computed widths
@@ -66,7 +66,7 @@ when the inputs (thread data + config) haven't changed."""
 
 _COL_TID = 10
 _COL_AGENT = 12
-_COL_MSGS = 4
+_COL_MSGS = 8
 _COL_BRANCH = 16
 _COL_TIMESTAMP = None
 _MAX_SEARCH_TEXT_LEN = 200
@@ -74,6 +74,7 @@ _COL_PROMPT = None
 _AUTO_WIDTH_COLUMNS = {"agent_name", "created_at", "updated_at", "cwd"}
 _COLUMN_ORDER = (
     "thread_id",
+    "thread_name",
     "agent_name",
     "messages",
     "created_at",
@@ -84,6 +85,7 @@ _COLUMN_ORDER = (
 )
 _COLUMN_WIDTHS: dict[str, int | None] = {
     "thread_id": _COL_TID,
+    "thread_name": None,
     "agent_name": _COL_AGENT,
     "messages": _COL_MSGS,
     "created_at": _COL_TIMESTAMP,
@@ -94,8 +96,9 @@ _COLUMN_WIDTHS: dict[str, int | None] = {
 }
 _COLUMN_LABELS = {
     "thread_id": "Thread ID",
+    "thread_name": "Name",
     "agent_name": "Agent",
-    "messages": "Msgs",
+    "messages": "# msg",
     "created_at": "Created",
     "updated_at": "Updated",
     "git_branch": "Branch",
@@ -104,6 +107,7 @@ _COLUMN_LABELS = {
 }
 _COLUMN_TOGGLE_LABELS = {
     "thread_id": "Thread ID",
+    "thread_name": "Name",
     "agent_name": "Agent Name",
     "messages": "# Messages",
     "created_at": "Created At",
@@ -296,11 +300,13 @@ def _format_column_value(
         # Strip UUID separators in the compact table preview so truncation
         # never leaves a dangling trailing hyphen in the thread ID column.
         value = thread["thread_id"].replace("-", "")
+    elif key == "thread_name":
+        value = _collapse_whitespace(thread.get("thread_name") or "")
     elif key == "agent_name":
         value = thread.get("agent_name") or _UNKNOWN_AGENT_LABEL
     elif key == "messages":
         raw_count = thread.get("message_count")
-        value = str(raw_count) if raw_count is not None else "..."
+        value = str(raw_count) if raw_count is not None else "Loading"
     elif key == "created_at":
         value = fmt(thread.get("created_at"))
     elif key == "updated_at":
@@ -310,7 +316,11 @@ def _format_column_value(
     elif key == "cwd":
         value = format_path(thread.get("cwd"))
     elif key == "initial_prompt":
-        value = _collapse_whitespace(thread.get("initial_prompt") or "")
+        value = (
+            _collapse_whitespace(thread["initial_prompt"] or "")
+            if "initial_prompt" in thread
+            else "Loading"
+        )
     else:
         value = ""
 
@@ -696,6 +706,7 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
         Binding("enter", "select", "Select", show=False, priority=True),
         Binding("escape", "cancel", "Cancel", show=False, priority=True),
         Binding("ctrl+d", "delete_thread", "Delete", show=False, priority=True),
+        Binding("ctrl+c", "copy_thread_id", "Copy ID", show=False, priority=True),
         Binding("tab", "focus_next_filter", "Next filter", show=False, priority=True),
         Binding(
             "shift+tab",
@@ -708,9 +719,9 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
     """Key bindings for thread navigation, selection, deletion, and filter focus.
 
     Arrows move the cursor, Page Up/Down jump by a visual page, Enter
-    selects the highlighted thread, Ctrl+D opens the delete-confirmation
-    overlay, Tab/Shift+Tab rotate focus through the filter input, the
-    scope/sort/agent dropdowns, and the relative-timestamp and
+    selects the highlighted thread, Ctrl+C copies its full ID, Ctrl+D opens the
+    delete-confirmation overlay, Tab/Shift+Tab rotate focus through the filter
+    input, the scope/sort/agent dropdowns, and the relative-timestamp and
     column-visibility checkboxes, and Esc dismisses. All bindings use
     `priority=True` so they take precedence over the embedded filter
     `Input`, `Select`, and checkbox widgets; vim-style `j`/`k` bindings are
@@ -866,6 +877,15 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
         width: 10;
     }
 
+    ThreadSelectorScreen .thread-cell-thread_name {
+        width: 1fr;
+        min-width: 5;
+        max-width: 24;
+        overflow-x: hidden;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+
     ThreadSelectorScreen .thread-cell-agent_name {
         width: auto;
         overflow-x: hidden;
@@ -922,6 +942,9 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
         thread_limit: int | None = None,
         initial_threads: list[ThreadInfo] | None = None,
         filter_cwd: str | _Sentinel | None = _CWD_DEFAULT,
+        initial_query: str = "",
+        reference_mode: bool = False,
+        validate_selection: Callable[[str], None] | None = None,
     ) -> None:
         """Initialize the `ThreadSelectorScreen`.
 
@@ -937,10 +960,17 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
                 view to "all directories". Pass an explicit path to scope to
                 that directory, or `None` to start the picker with no cwd
                 filter.
+            initial_query: Search text carried from the compact picker.
+            reference_mode: Whether selection returns a reference instead of
+                resuming the selected thread.
+            validate_selection: Optional check that raises if selection is blocked.
         """
         super().__init__()
         self._current_thread = current_thread
         self._thread_limit = thread_limit
+        self._initial_query = initial_query
+        self._reference_mode = reference_mode
+        self._validate_selection = validate_selection
 
         from deepagents_code.model_config import load_thread_config
 
@@ -966,7 +996,7 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
         self._disk_load_complete = False
         self._selected_index = 0
         self._option_widgets: list[ThreadOption] = []
-        self._filter_text = ""
+        self._filter_text = initial_query
         self._filter_agent: str | None = None
         # Configured agent names from `~/.deepagents/` (the `/agents` list),
         # loaded off the event loop in `_load_threads`. Unioned with
@@ -986,7 +1016,9 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
         # Cached threads are pre-sorted by updated_at DESC (the only sort
         # order the cache stores).  Skip the O(n log n) re-sort when that
         # matches the user's preference.
-        if not (self._has_initial_threads and self._sort_by_updated):
+        if self._filter_text:
+            self._update_filtered_list()
+        elif not (self._has_initial_threads and self._sort_by_updated):
             self._apply_sort()
         self._sync_selected_index()
         self._column_widths = self._compute_column_widths()
@@ -1028,6 +1060,8 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
         Returns:
             Plain string or `Content` with an embedded hyperlink.
         """
+        if self._reference_mode:
+            return "Reference Thread"
         if not self._current_thread:
             return "Select Thread"
         if thread_url:
@@ -1056,6 +1090,7 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
             f" {glyphs.bullet} Enter select"
             f" {glyphs.bullet} Tab/Shift+Tab focus options"
             f" {glyphs.bullet} Space toggle option"
+            f" {glyphs.bullet} Ctrl+C copy ID"
             f" {glyphs.bullet} Ctrl+D delete"
             f" {glyphs.bullet} Esc cancel"
         )
@@ -1282,6 +1317,7 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
             )
 
             yield Input(
+                value=self._initial_query,
                 placeholder="Type to search threads...",
                 select_on_focus=False,
                 id="thread-filter",
@@ -1459,6 +1495,10 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
         """Refresh the overflow indicator after the options pane scrolls."""
         event.stop()
         self.call_after_refresh(self._update_controls_overflow_hint)
+
+    def refresh_threads(self) -> None:
+        """Reload visible threads after an out-of-band metadata change."""
+        self._start_thread_load()
 
     def _start_thread_load(self) -> None:
         """Launch the thread-load worker after the initial layout pass."""
@@ -1646,7 +1686,7 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
         visible_keys = _visible_column_keys(self._columns)
         visible = frozenset(visible_keys)
         fingerprint = tuple(
-            (t["thread_id"], t.get("latest_checkpoint_id"))
+            (t["thread_id"], t.get("latest_checkpoint_id"), t.get("thread_name"))
             for t in self._filtered_threads
         )
 
@@ -1708,6 +1748,7 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
         format_path, _, _ = _get_format_fns()
         cwd = thread.get("cwd") or ""
         parts = [
+            thread.get("thread_name") or "",
             thread["thread_id"],
             thread.get("agent_name") or "",
             thread.get("git_branch") or "",
@@ -1849,14 +1890,14 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
 
     @staticmethod
     def _threads_match(old: list[ThreadInfo], new: list[ThreadInfo]) -> bool:
-        """Check whether two thread lists have the same IDs and checkpoints in order.
+        """Check whether thread IDs, checkpoints, and names match in order.
 
         Args:
             old: Previous thread list.
             new: Fresh thread list.
 
         Returns:
-            True if both lists have identical thread/checkpoint ID pairs.
+            True if both lists have identical thread IDs, checkpoints, and names.
         """
         if len(old) != len(new):
             return False
@@ -1864,6 +1905,8 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
             if a["thread_id"] != b["thread_id"]:
                 return False
             if a.get("latest_checkpoint_id") != b.get("latest_checkpoint_id"):
+                return False
+            if a.get("thread_name") != b.get("thread_name"):
                 return False
         return True
 
@@ -2351,7 +2394,29 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
             return
         if self._filtered_threads:
             thread_id = self._filtered_threads[self._selected_index]["thread_id"]
-            self.dismiss(thread_id)
+            self._select_thread(thread_id)
+
+    def _select_thread(self, thread_id: str) -> None:
+        if self._validate_selection is not None:
+            try:
+                self._validate_selection(thread_id)
+            except (OSError, RuntimeError) as exc:
+                self.notify(str(exc), severity="error", markup=False)
+                return
+        self.dismiss(thread_id)
+
+    def action_copy_thread_id(self) -> None:
+        """Copy the highlighted thread ID without dismissing the selector."""
+        if self._confirming_delete or not self._filtered_threads:
+            return
+        from deepagents_code.clipboard import copy_text_with_feedback
+
+        copy_text_with_feedback(
+            self.app,
+            self._filtered_threads[self._selected_index]["thread_id"],
+            failure_noun="selection",
+            success_message="Thread ID copied to clipboard",
+        )
 
     def action_focus_next_filter(self) -> None:
         """Move focus through the filter and column-toggle controls."""
@@ -2542,10 +2607,12 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
 
         try:
             await delete_thread(thread_id)
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error) as exc:
             logger.warning("Failed to delete thread %s", thread_id, exc_info=True)
             self.app.notify(
-                f"Failed to delete thread {thread_id[:8]}",
+                str(exc)
+                if isinstance(exc, BlockingIOError)
+                else f"Failed to delete thread {thread_id[:8]}",
                 severity="error",
                 timeout=3,
                 markup=False,
@@ -2591,7 +2658,7 @@ class ThreadSelectorScreen(ModalScreen[str | None]):
             return
         if 0 <= event.index < len(self._filtered_threads):
             self._selected_index = event.index
-            self.dismiss(event.thread_id)
+            self._select_thread(event.thread_id)
 
     def action_cancel(self) -> None:
         """Cancel the selection."""

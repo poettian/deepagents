@@ -4,20 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, NotRequired, TypedDict, cast
 
+from deepagents_code._constants import DEFAULT_THREAD_LIMIT
 from deepagents_code._paths import harden_state_dir
 from deepagents_code.goal_state_notice import is_internal_message
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Mapping
 
     import aiosqlite
+    from langchain_core.runnables import RunnableConfig
     from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -33,6 +37,7 @@ _initial_prompt_cache: dict[str, tuple[str | None, str | None]] = {}
 _MAX_INITIAL_PROMPT_CACHE = 4096
 _recent_threads_cache: dict[tuple[str | None, int], list[ThreadInfo]] = {}
 _MAX_RECENT_THREADS_CACHE_KEYS = 16
+MAX_THREAD_NAME_LENGTH = 50
 _DEFAULT_SQLITE_TIMEOUT = 5.0
 """Seconds to wait out a locked database; matches the `sqlite3` default."""
 
@@ -208,6 +213,9 @@ class ThreadInfo(TypedDict):
 
     initial_prompt: NotRequired[str | None]
     """First human message in the thread."""
+
+    thread_name: NotRequired[str | None]
+    """User-assigned or generated thread name."""
 
     message_count: NotRequired[int]
     """Number of messages in the thread."""
@@ -385,7 +393,7 @@ async def _table_exists(conn: aiosqlite.Connection, table: str) -> bool:
         return await cursor.fetchone() is not None
 
 
-_THREADS_LIST_INDEX = "idx_dcode_threads_list"
+_THREADS_LIST_INDEX = "idx_dcode_threads_list_v2"
 """Covering index that makes the `list_threads` GROUP BY an index-only scan.
 
 LangGraph's `SqliteSaver` stores each checkpoint's full state blob inline in the
@@ -405,8 +413,11 @@ in order. Keep the indexed expressions in sync with the `list_threads` query.
 async def _ensure_threads_list_index(conn: aiosqlite.Connection) -> None:
     """Create the `list_threads` covering index if it does not already exist.
 
-    Idempotent: `CREATE INDEX IF NOT EXISTS` is a near-instant catalog check once
-    the index exists. The one-time build on a pre-existing large database costs a
+    Reuse either v2 or its v3 superset from early thread-naming builds. Rebuilding
+    it to include names can hold the write lock past workspace binding's timeout.
+    Names are loaded separately for the displayed threads instead.
+
+    The one-time build on a pre-existing large database costs a
     single full table scan (seconds to tens of seconds), after which every
     `list_threads` call is a sub-second index-only scan. Runs in the aiosqlite
     worker thread, so it does not block the event loop.
@@ -416,15 +427,25 @@ async def _ensure_threads_list_index(conn: aiosqlite.Connection) -> None:
     list` (e.g. on a read-only database or under write-lock contention).
     """
     try:
+        async with conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name IN (?, ?)",
+            (_THREADS_LIST_INDEX, "idx_dcode_threads_list_v3"),
+        ) as cursor:
+            if await cursor.fetchone():
+                return
         await conn.execute(
             f"CREATE INDEX IF NOT EXISTS {_THREADS_LIST_INDEX} ON checkpoints("
             "thread_id, "
             "json_extract(metadata, '$.updated_at'), "
+            "COALESCE(json_extract(metadata, '$.created_at'), "
+            "json_extract(metadata, '$.updated_at')), "
             "checkpoint_id, "
             "json_extract(metadata, '$.agent_name'), "
             "json_extract(metadata, '$.git_branch'), "
             "json_extract(metadata, '$.cwd'))"
         )
+        # Replace the older index, which did not cover the creation timestamp.
+        await conn.execute("DROP INDEX IF EXISTS idx_dcode_threads_list")
         await conn.commit()
     except Exception:
         logger.warning(
@@ -435,9 +456,52 @@ async def _ensure_threads_list_index(conn: aiosqlite.Connection) -> None:
         )
 
 
+async def _populate_thread_names(
+    conn: aiosqlite.Connection, threads: list[ThreadInfo]
+) -> None:
+    """Load names after limiting the list, keeping its covering index unchanged."""
+    names: dict[str, str | None] = {}
+    if await _table_exists(conn, "dcode_thread_names"):
+        async with conn.execute(
+            "SELECT thread_id, name FROM dcode_thread_names "
+            "WHERE thread_id IN (SELECT value FROM json_each(?))",
+            (json.dumps([thread["thread_id"] for thread in threads]),),
+        ) as cursor:
+            names = {row[0]: row[1] for row in await cursor.fetchall()}
+    missing = [
+        thread["thread_id"] for thread in threads if thread["thread_id"] not in names
+    ]
+    if missing:
+        names.update(await _checkpoint_thread_names(conn, missing))
+    for thread in threads:
+        thread["thread_name"] = names.get(thread["thread_id"])
+
+
+async def _checkpoint_thread_names(
+    conn: aiosqlite.Connection, thread_ids: list[str]
+) -> dict[str, str | None]:
+    """Read names from the latest root checkpoints of the requested threads.
+
+    Saved names come from `dcode_thread_names`; this fallback is for checkpoint
+    metadata only. Seek via the primary key instead of scanning an unnamed
+    thread's entire history looking for a non-null name.
+
+    Returns:
+        Names found in the latest checkpoints, keyed by thread ID.
+    """
+    async with conn.execute(
+        "SELECT value, (SELECT json_extract(metadata, '$.thread_name') "
+        "FROM checkpoints WHERE thread_id = requested.value "
+        "AND checkpoint_ns = '' "
+        "ORDER BY checkpoint_id DESC LIMIT 1) FROM json_each(?) AS requested",
+        (json.dumps(thread_ids),),
+    ) as cursor:
+        return {row[0]: row[1] for row in await cursor.fetchall()}
+
+
 async def list_threads(
     agent_name: str | None = None,
-    limit: int = 20,
+    limit: int = DEFAULT_THREAD_LIMIT,
     include_message_count: bool = False,
     sort_by: str = "updated",
     branch: str | None = None,
@@ -465,8 +529,13 @@ async def list_threads(
     Raises:
         ValueError: If `sort_by` is not `"updated"` or `"created"`.
     """
+    started_at = time.perf_counter()
     async with _connect() as conn:
         if not await _table_exists(conn, "checkpoints"):
+            logger.debug(
+                "Thread metadata listing completed in %.1f ms: rows=0",
+                (time.perf_counter() - started_at) * 1000,
+            )
             return []
 
         # Ensure the covering index exists before the GROUP BY below, so the
@@ -499,7 +568,8 @@ async def list_threads(
                    json_extract(metadata, '$.agent_name') as agent_name,
                    MAX(json_extract(metadata, '$.updated_at')) as updated_at,
                    MAX(checkpoint_id) as latest_checkpoint_id,
-                   MIN(json_extract(metadata, '$.updated_at')) as created_at,
+                   MIN(COALESCE(json_extract(metadata, '$.created_at'),
+                                json_extract(metadata, '$.updated_at'))) as created_at,
                    MAX(json_extract(metadata, '$.git_branch')) as git_branch,
                    MAX(json_extract(metadata, '$.cwd')) as cwd
             FROM checkpoints
@@ -525,6 +595,9 @@ async def list_threads(
                 for r in rows
             ]
 
+        if threads:
+            await _populate_thread_names(conn, threads)
+
         # Fetch message counts if requested
         if include_message_count and threads:
             await _populate_message_counts(conn, threads)
@@ -533,6 +606,12 @@ async def list_threads(
         # doesn't receive branch-/cwd-filtered or differently-sorted data.
         if sort_by == "updated" and branch is None and cwd is None:
             _cache_recent_threads(agent_name, limit, threads)
+        logger.debug(
+            "Thread metadata listing completed in %.1f ms: rows=%d sort=%s",
+            (time.perf_counter() - started_at) * 1000,
+            len(threads),
+            sort_by,
+        )
         return threads
 
 
@@ -558,6 +637,27 @@ async def populate_thread_checkpoint_details(
     if not threads or (not include_message_count and not include_initial_prompt):
         return threads
 
+    return await _enrich_thread_checkpoint_details(
+        threads,
+        include_message_count=include_message_count,
+        include_initial_prompt=include_initial_prompt,
+        source="picker",
+    )
+
+
+async def _enrich_thread_checkpoint_details(
+    threads: list[ThreadInfo],
+    *,
+    include_message_count: bool,
+    include_initial_prompt: bool,
+    source: str,
+) -> list[ThreadInfo]:
+    """Enrich threads and record the caller context for diagnostics.
+
+    Returns:
+        The enriched thread list.
+    """
+    started_at = time.perf_counter()
     async with _connect() as conn:
         await _populate_checkpoint_fields(
             conn,
@@ -565,6 +665,15 @@ async def populate_thread_checkpoint_details(
             include_message_count=include_message_count,
             include_initial_prompt=include_initial_prompt,
         )
+    logger.debug(
+        "Thread enrichment completed in %.1f ms: source=%s rows=%d "
+        "counts=%s prompts=%s",
+        (time.perf_counter() - started_at) * 1000,
+        source,
+        len(threads),
+        include_message_count,
+        include_initial_prompt,
+    )
     return threads
 
 
@@ -594,10 +703,11 @@ async def prewarm_thread_message_counts(limit: int | None = None) -> None:
         cfg = load_thread_config()
         threads = await list_threads(limit=thread_limit, include_message_count=False)
         if threads:
-            await populate_thread_checkpoint_details(
+            await _enrich_thread_checkpoint_details(
                 threads,
                 include_message_count=cfg.columns.get("messages", False),
                 include_initial_prompt=cfg.columns.get("initial_prompt", False),
+                source="startup-prewarm",
             )
         _cache_recent_threads(None, thread_limit, threads)
     except (OSError, sqlite3.Error):
@@ -716,8 +826,13 @@ async def _get_jsonplus_serializer() -> JsonPlusSerializer:
     if _jsonplus_serializer is not None:
         return _jsonplus_serializer
 
+    started_at = time.perf_counter()
     loop = asyncio.get_running_loop()
     _jsonplus_serializer = await loop.run_in_executor(None, _create_jsonplus_serializer)
+    logger.debug(
+        "Thread serializer initialization completed in %.1f ms",
+        (time.perf_counter() - started_at) * 1000,
+    )
     return _jsonplus_serializer
 
 
@@ -831,6 +946,12 @@ async def _populate_checkpoint_fields(
         if needs_count or needs_prompt:
             uncached.append(thread)
 
+    logger.debug(
+        "Thread enrichment cache lookup: rows=%d hits=%d misses=%d",
+        len(threads),
+        len(threads) - len(uncached),
+        len(uncached),
+    )
     if not uncached:
         return
 
@@ -838,8 +959,16 @@ async def _populate_checkpoint_fields(
     uncached_ids = [t["thread_id"] for t in uncached]
     batch_results: dict[str, _CheckpointSummary] = {}
     if include_message_count or include_initial_prompt:
+        phase_started_at = time.perf_counter()
         batch_results = await _load_latest_checkpoint_summaries_batch(
             conn, uncached_ids, serde
+        )
+        logger.debug(
+            "Latest checkpoint loading and decoding completed in %.1f ms: "
+            "requested=%d loaded=%d",
+            (time.perf_counter() - phase_started_at) * 1000,
+            len(uncached_ids),
+            len(batch_results),
         )
     # `initial_prompt` cannot be recovered from the latest checkpoint alone:
     # `after_model` middleware (e.g., `ResumeStateMiddleware`) writes partial
@@ -848,8 +977,15 @@ async def _populate_checkpoint_fields(
     # row holds the user's original input.
     prompt_results: dict[str, str | None] = {}
     if include_initial_prompt:
+        phase_started_at = time.perf_counter()
         prompt_results = await _load_initial_prompts_from_writes_batch(
             conn, uncached_ids, serde
+        )
+        logger.debug(
+            "Initial prompt loading completed in %.1f ms: requested=%d loaded=%d",
+            (time.perf_counter() - phase_started_at) * 1000,
+            len(uncached_ids),
+            len(prompt_results),
         )
 
     # Phase 3: apply inline results, deferring threads whose latest checkpoint
@@ -883,8 +1019,16 @@ async def _populate_checkpoint_fields(
     # Phase 4: reconstruct counts for delta-channel threads from the `writes`
     # table by replaying the `messages` writes through the canonical reducer.
     if needs_writes_count:
+        phase_started_at = time.perf_counter()
         writes_counts = await _load_message_counts_from_writes_batch(
             conn, needs_writes_count, serde
+        )
+        logger.debug(
+            "Message write fetching and count reconstruction completed in %.1f ms: "
+            "requested=%d counted=%d",
+            (time.perf_counter() - phase_started_at) * 1000,
+            len(needs_writes_count),
+            len(writes_counts),
         )
         uncached_by_id = {t["thread_id"]: t for t in uncached}
         for thread_id in needs_writes_count:
@@ -931,14 +1075,17 @@ async def _load_latest_checkpoint_summaries_batch(
         chunk = thread_ids[start : start + _SQLITE_MAX_VARIABLE_NUMBER]
         placeholders = ",".join("?" * len(chunk))
         query = f"""
-            SELECT thread_id, type, checkpoint FROM (
-                SELECT thread_id, type, checkpoint,
+            SELECT c.thread_id, c.type, c.checkpoint
+            FROM checkpoints AS c
+            JOIN (
+                SELECT rowid AS rid,
                        ROW_NUMBER() OVER (
                            PARTITION BY thread_id ORDER BY checkpoint_id DESC
                        ) AS rn
                 FROM checkpoints
                 WHERE thread_id IN ({placeholders})
-            ) WHERE rn = 1
+            ) AS ranked ON c.rowid = ranked.rid
+            WHERE ranked.rn = 1
         """  # noqa: S608  # placeholders built from len(chunk); user values use ? params
         async with conn.execute(query, chunk) as cursor:
             rows = await cursor.fetchall()
@@ -1001,15 +1148,18 @@ async def _load_initial_prompts_from_writes_batch(
         chunk = thread_ids[start : start + _SQLITE_MAX_VARIABLE_NUMBER]
         placeholders = ",".join("?" * len(chunk))
         query = f"""
-            SELECT thread_id, type, value FROM (
-                SELECT thread_id, type, value,
+            SELECT w.thread_id, w.type, w.value
+            FROM writes AS w
+            JOIN (
+                SELECT rowid AS rid,
                        ROW_NUMBER() OVER (
                            PARTITION BY thread_id
                            ORDER BY checkpoint_id ASC, idx ASC
                        ) AS rn
                 FROM writes
                 WHERE thread_id IN ({placeholders}) AND channel = 'messages'
-            ) WHERE rn = 1
+            ) AS ranked ON w.rowid = ranked.rid
+            WHERE ranked.rn = 1
         """  # noqa: S608  # placeholders built from len(chunk); user values use ? params
         async with conn.execute(query, chunk) as cursor:
             rows = await cursor.fetchall()
@@ -1407,6 +1557,24 @@ async def get_most_recent(
             return row[0] if row else None
 
 
+async def get_recent_thread_ids(agent_name: str | None = None) -> list[str]:
+    """List distinct threads in checkpoint recency order, optionally agent-filtered.
+
+    Returns:
+        Matching thread IDs, newest checkpoint first.
+    """
+    async with _connect() as conn:
+        if not await _table_exists(conn, "checkpoints"):
+            return []
+        query = (
+            "SELECT thread_id FROM checkpoints "
+            "WHERE (? IS NULL OR json_extract(metadata, '$.agent_name') = ?) "
+            "GROUP BY thread_id ORDER BY MAX(checkpoint_id) DESC"
+        )
+        async with conn.execute(query, (agent_name, agent_name)) as cursor:
+            return [row[0] for row in await cursor.fetchall()]
+
+
 async def get_thread_updated_at(thread_id: str) -> str | None:
     """Get the latest stored update timestamp for a thread.
 
@@ -1426,6 +1594,36 @@ async def get_thread_updated_at(thread_id: str) -> str | None:
             row = await cursor.fetchone()
             value = row[0] if row else None
             return value if isinstance(value, str) and value else None
+
+
+async def refresh_thread_activity(thread_id: str, updated_at: datetime) -> None:
+    """Advance local discovery metadata after reading remote model activity.
+
+    Only the latest root checkpoint is updated, preserving historical metadata
+    and any newer timestamp already written by a shared server checkpointer.
+    Preserve its original timestamp separately so a lone discovery seed keeps
+    its creation time as remote activity advances.
+
+    Args:
+        thread_id: Thread whose remote state was read.
+        updated_at: Verified model-request time from the remote checkpoint.
+    """
+    async with _connect() as conn:
+        if not await _table_exists(conn, "checkpoints"):
+            return
+        timestamp = updated_at.isoformat()
+        await conn.execute(
+            "UPDATE checkpoints SET metadata = json_set(metadata, "
+            "'$.created_at', COALESCE(json_extract(metadata, '$.created_at'), "
+            "json_extract(metadata, '$.updated_at')), '$.updated_at', ?) "
+            "WHERE thread_id = ? AND checkpoint_ns = '' AND checkpoint_id = "
+            "(SELECT MAX(checkpoint_id) FROM checkpoints "
+            "WHERE thread_id = ? AND checkpoint_ns = '') "
+            "AND COALESCE(julianday(json_extract(metadata, '$.updated_at')), 0) "
+            "< julianday(?)",
+            (timestamp, thread_id, thread_id, timestamp),
+        )
+        await conn.commit()
 
 
 async def get_thread_agent(thread_id: str) -> str | None:
@@ -1518,50 +1716,174 @@ async def find_similar_threads(thread_id: str, limit: int = 3) -> list[str]:
             return [r[0] for r in rows]
 
 
+def validate_thread_name(name: str) -> str:
+    """Validate a thread name.
+
+    Args:
+        name: Proposed name.
+
+    Returns:
+        Trimmed name.
+
+    Raises:
+        ValueError: If empty, overlong, or containing nonprintable characters.
+    """
+    if any(not char.isprintable() for char in name):
+        msg = "Thread names must be a single line without control characters"
+        raise ValueError(msg)
+    name = name.strip()
+    if not name or len(name) > MAX_THREAD_NAME_LENGTH:
+        msg = "Thread names must contain between 1 and 50 characters"
+        raise ValueError(msg)
+    return name
+
+
+async def get_thread_name(thread_id: str) -> str | None:
+    """Read a thread's durable name independently of checkpoint revisions.
+
+    Args:
+        thread_id: Thread to look up.
+
+    Returns:
+        Saved name, or `None` for unnamed threads.
+    """
+    async with _connect() as conn:
+        if await _table_exists(conn, "dcode_thread_names"):
+            async with conn.execute(
+                "SELECT name FROM dcode_thread_names WHERE thread_id = ?", (thread_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return row[0]
+        if not await _table_exists(conn, "checkpoints"):
+            return None
+        return (await _checkpoint_thread_names(conn, [thread_id])).get(thread_id)
+
+
+async def rename_thread(
+    thread_id: str, name: str, *, only_if_unnamed: bool = False
+) -> bool:
+    """Atomically name an existing thread without mutating its conversation.
+
+    Args:
+        thread_id: Thread to name.
+        name: Nonempty, printable, single-line name of at most 50 characters.
+        only_if_unnamed: Preserve a previously generated or manually assigned name.
+
+    Returns:
+        Whether an existing thread was renamed.
+    """
+    name = validate_thread_name(name)
+    async with _connect() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        if not await _table_exists(conn, "checkpoints"):
+            return False
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS dcode_thread_names "
+            "(thread_id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL)"
+        )
+        async with conn.execute(
+            "INSERT INTO dcode_thread_names (thread_id, name) "
+            "SELECT ?, ? WHERE EXISTS "
+            "(SELECT 1 FROM checkpoints WHERE thread_id = ?) "
+            "AND (? = 0 OR NOT EXISTS (SELECT 1 FROM checkpoints "
+            "WHERE thread_id = ? "
+            "AND json_extract(metadata, '$.thread_name') IS NOT NULL)) "
+            "ON CONFLICT(thread_id) DO UPDATE SET name = excluded.name WHERE ? = 0",
+            (thread_id, name, thread_id, only_if_unnamed, thread_id, only_if_unnamed),
+        ) as cursor:
+            if not cursor.rowcount:
+                return False
+        await conn.execute(
+            "UPDATE checkpoints SET metadata = json_set(metadata, '$.thread_name', ?) "
+            "WHERE thread_id = ? AND checkpoint_id = "
+            "(SELECT MAX(checkpoint_id) FROM checkpoints WHERE thread_id = ?)",
+            (name, thread_id, thread_id),
+        )
+        await conn.commit()
+    for rows in _recent_threads_cache.values():
+        for thread in rows:
+            if thread["thread_id"] == thread_id:
+                thread["thread_name"] = name
+    return True
+
+
 async def delete_thread(thread_id: str) -> bool:
-    """Delete thread checkpoints and any offloaded conversation history.
+    """Delete thread checkpoints, side-question costs, and offloaded history.
 
     Removes the thread's checkpoint/write rows, then makes a best-effort attempt
-    to remove the per-thread offloaded conversation-history archive under
+    to remove the per-thread compaction archive and handoff snapshots under
     `~/.deepagents` (local mode) so deletion does not leave orphaned history
     behind. History cleanup failures are logged, not raised, and do not affect
     the return value, which reflects only whether checkpoint rows were removed.
 
     Returns:
         True if thread checkpoints were deleted, False if not found.
+
+    Raises:
+        BlockingIOError: The thread is reserved by a live client.
     """
-    deleted = False
-    async with _connect() as conn:
-        if await _table_exists(conn, "checkpoints"):
-            cursor = await conn.execute(
-                "DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,)
-            )
-            deleted = cursor.rowcount > 0
-            if await _table_exists(conn, "writes"):
+    from deepagents_code.btw_cost import delete_cost
+    from deepagents_code.thread_ownership import (
+        _finish_mutation,
+        try_acquire,
+        writer_guard,
+    )
+
+    db_path = get_db_path()
+    lease = try_acquire(thread_id, db_path=db_path)
+    if lease is None:
+        msg = f"Thread {thread_id} is open elsewhere. Close it there before deleting."
+        raise BlockingIOError(msg)
+
+    async def remove() -> bool:
+        deleted = False
+        async with _connect() as conn:
+            await delete_cost(conn, thread_id)
+            if await _table_exists(conn, "dcode_thread_names"):
                 await conn.execute(
-                    "DELETE FROM writes WHERE thread_id = ?", (thread_id,)
+                    "DELETE FROM dcode_thread_names WHERE thread_id = ?", (thread_id,)
                 )
+            if await _table_exists(conn, "checkpoints"):
+                cursor = await conn.execute(
+                    "DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,)
+                )
+                deleted = cursor.rowcount > 0
+                if await _table_exists(conn, "writes"):
+                    await conn.execute(
+                        "DELETE FROM writes WHERE thread_id = ?", (thread_id,)
+                    )
+                if deleted:
+                    _message_count_cache.pop(thread_id, None)
+                    for key, rows in list(_recent_threads_cache.items()):
+                        filtered = [
+                            row for row in rows if row["thread_id"] != thread_id
+                        ]
+                        _recent_threads_cache[key] = filtered
             await conn.commit()
-            if deleted:
-                _message_count_cache.pop(thread_id, None)
-                for key, rows in list(_recent_threads_cache.items()):
-                    filtered = [row for row in rows if row["thread_id"] != thread_id]
-                    _recent_threads_cache[key] = filtered
 
-    from deepagents_code.offload import delete_offloaded_history
+        from deepagents_code.offload import delete_offloaded_history
 
-    delete_offloaded_history(thread_id)
-    return deleted
+        delete_offloaded_history(thread_id)
+        return deleted
+
+    try:
+        async with writer_guard(thread_id, db_path=db_path, token=lease.token):
+            return await _finish_mutation(remove())
+    finally:
+        lease.release()
 
 
 @asynccontextmanager
 async def get_checkpointer() -> AsyncIterator[AsyncSqliteSaver]:
-    """Get AsyncSqliteSaver for the global database.
+    """Get a checkpointer requiring live thread ownership for database writes.
 
     Yields:
-        AsyncSqliteSaver instance for checkpoint persistence.
+        AsyncSqliteSaver enforcing thread reservations and fencing tokens.
     """
-    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    from deepagents_code.thread_ownership import owned_saver_class
+
+    saver_class = owned_saver_class(db_path=get_db_path())
 
     # Built here rather than through `AsyncSqliteSaver.from_conn_string` so the
     # connection is one this module owns and can clean up after an interrupted
@@ -1569,12 +1891,97 @@ async def get_checkpointer() -> AsyncIterator[AsyncSqliteSaver]:
     conn = _new_connection()
     try:
         async with conn as opened:
-            yield AsyncSqliteSaver(opened)
+            yield saver_class(opened)
     finally:
         await _drain_aiosqlite_worker(conn)
 
 
-_DEFAULT_THREAD_LIMIT = 20
+async def save_thread_seed(
+    thread_id: str, values: Mapping[str, object], *, agent_name: str, cwd: str
+) -> None:
+    """Index a remote handoff locally with its initial summary and resume metadata.
+
+    Only seed an absent thread; never replace shared server checkpoints. Thread
+    history still loads from the connected agent, so subsequent remote turns
+    take precedence over this discovery snapshot. Reserve the local thread for
+    the save when this process does not already own it.
+
+    Args:
+        thread_id: Newly seeded remote thread identifier.
+        values: Initial message and model state saved on the server.
+        agent_name: Agent that owns the new thread.
+        cwd: Workspace directory used for thread discovery.
+
+    """
+    from deepagents_code.thread_ownership import OWNER_KEY, ensure_owned, held_lease
+
+    existing = held_lease(thread_id)
+    lease = existing or ensure_owned(thread_id)
+    try:
+        await _save_thread_seed(
+            {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": "",
+                    OWNER_KEY: lease.token,
+                },
+                "metadata": {"agent_name": agent_name, "cwd": cwd},
+            },
+            values,
+        )
+    finally:
+        if existing is None:
+            lease.release()
+
+
+async def _save_thread_seed(
+    config: RunnableConfig, values: Mapping[str, object]
+) -> None:
+    """Write the initial checkpoint while the caller holds its reservation."""
+    from langgraph.checkpoint.base import empty_checkpoint
+
+    checkpoint = empty_checkpoint()
+    config.setdefault("metadata", {})["updated_at"] = checkpoint["ts"]
+    async with get_checkpointer() as checkpointer:
+        if await checkpointer.aget_tuple(config) is not None:
+            return
+        checkpoint["channel_values"] = dict(values)
+        version = checkpointer.get_next_version(None, None)
+        checkpoint["channel_versions"] = dict.fromkeys(values, version)
+        await checkpointer.aput(
+            config,
+            checkpoint,
+            {"source": "update", "step": 0, "parents": {}},
+            checkpoint["channel_versions"],
+        )
+
+
+async def set_thread_metadata(thread_id: str, *, agent_name: str, cwd: str) -> None:
+    """Persist discovery and resume metadata on a newly checkpointed thread.
+
+    The remote state-update API does not forward config metadata. Stamp the
+    saved checkpoints before exposing a newly seeded thread to the user.
+
+    Args:
+        thread_id: Newly seeded thread identifier.
+        agent_name: Agent that owns the new thread.
+        cwd: Workspace directory used for thread discovery.
+
+    Raises:
+        RuntimeError: If the thread has no saved checkpoint.
+    """
+    from datetime import UTC
+
+    async with _connect() as conn:
+        async with conn.execute(
+            "UPDATE checkpoints SET metadata = json_set(metadata, "
+            "'$.agent_name', ?, '$.cwd', ?, '$.updated_at', ?) WHERE thread_id = ?",
+            (agent_name, cwd, datetime.now(UTC).isoformat(), thread_id),
+        ) as cursor:
+            if not cursor.rowcount:
+                msg = f"Thread {thread_id} has no saved checkpoint"
+                raise RuntimeError(msg)
+        await conn.commit()
 
 
 def get_thread_limit() -> int:
@@ -1589,7 +1996,7 @@ def get_thread_limit() -> int:
 
     raw = os.environ.get(RECENT_THREADS)
     if raw is None:
-        return _DEFAULT_THREAD_LIMIT
+        return DEFAULT_THREAD_LIMIT
     try:
         return max(1, int(raw))
     except ValueError:
@@ -1597,9 +2004,9 @@ def get_thread_limit() -> int:
             "Invalid %s value %r, using default %d",
             RECENT_THREADS,
             raw,
-            _DEFAULT_THREAD_LIMIT,
+            DEFAULT_THREAD_LIMIT,
         )
-        return _DEFAULT_THREAD_LIMIT
+        return DEFAULT_THREAD_LIMIT
 
 
 async def list_threads_command(
@@ -1734,6 +2141,7 @@ async def list_threads_command(
 
     table = Table(title=title, show_header=True, header_style=f"bold {theme.PRIMARY}")
     table.add_column("Thread ID", style="bold")
+    table.add_column("Name", max_width=50, no_wrap=True)
     table.add_column("Agent")
     table.add_column("Messages", justify="right")
     if verbose:
@@ -1749,6 +2157,7 @@ async def list_threads_command(
     for t in threads:
         row: list[str] = [
             t["thread_id"],
+            escape_markup(t.get("thread_name") or ""),
             t["agent_name"] or "unknown",
             str(t.get("message_count", 0)),
         ]
@@ -1792,6 +2201,9 @@ async def delete_thread_command(
         thread_id: ID of the thread to delete.
         dry_run: If `True`, print what would happen without making changes.
         output_format: Output format — `'text'` (Rich) or `'json'`.
+
+    Raises:
+        SystemExit: The thread is occupied and cannot be deleted.
     """
     if dry_run:
         exists = await thread_exists(thread_id)
@@ -1816,7 +2228,21 @@ async def delete_thread_command(
         console.print("No changes made.", style="dim")
         return
 
-    deleted = await delete_thread(thread_id)
+    try:
+        deleted = await delete_thread(thread_id)
+    except BlockingIOError as exc:
+        if output_format == "json":
+            from deepagents_code.output import write_json
+
+            write_json(
+                "threads delete",
+                {"thread_id": thread_id, "deleted": False, "error": str(exc)},
+            )
+        else:
+            from deepagents_code.config import console
+
+            console.print(str(exc), style="red", markup=False, highlight=False)
+        raise SystemExit(1) from None
 
     if output_format == "json":
         from deepagents_code.output import write_json

@@ -2,6 +2,71 @@
 
 # Deep Agents Changelog
 
+## [0.7.23](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.22...deepagents==0.7.23) (2026-10-07)
+
+### Features
+
+- Pin skills by name with `pinned_skills` in the SDK ([#6810](https://github.com/langchain-ai/deepagents/pull/6810)).
+
+### Bug Fixes
+
+- Ensure each subagent uses its own `SkillsMiddleware` in the skills slot ([#6820](https://github.com/langchain-ai/deepagents/pull/6820)).
+
+## [0.7.22](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.21...deepagents==0.7.22) (2026-10-05)
+
+### Features
+
+- Load a skill’s tools only when the skill is read. ([#6552](https://github.com/langchain-ai/deepagents/pull/6552))
+
+### Bug Fixes
+
+- Reset stale encoding when overwriting text. ([#6737](https://github.com/langchain-ai/deepagents/pull/6737))
+
+## [0.7.21](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.20...deepagents==0.7.21) (2026-09-30)
+
+### Features
+
+- `FilesystemMiddleware` can now store blobs on the backend ([#6550](https://github.com/langchain-ai/deepagents/pull/6550)).
+
+## [0.7.20](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.19...deepagents==0.7.20) (2026-09-29)
+
+### Bug Fixes
+
+- Fixed binary content in `StateBackend.upload_files` being tagged as base64.
+
+## [0.7.19](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.18...deepagents==0.7.19) (2026-09-24)
+
+### Bug Fixes
+
+- Recover when `read_file` media is rejected.
+- Filter unsupported multimodal content through separate middleware.
+- Bound tool offload paths and abbreviate long IDs.
+
+## [0.7.18](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.17...deepagents==0.7.18) (2026-09-22)
+
+### Bug Fixes
+
+- Large tool result previews now more clearly explain when output was clipped or truncated, including byte-cap losses, per-line clipping, and showing truncation notices only when truncation occurs. Legacy large-result preview templates are preserved behind a deprecation path. ([#5567](https://github.com/langchain-ai/deepagents/pull/5567), [#5564](https://github.com/langchain-ai/deepagents/pull/5564), [#5563](https://github.com/langchain-ai/deepagents/pull/5563), [#5568](https://github.com/langchain-ai/deepagents/pull/5568))
+- Task tool calls now reject unknown argument keys instead of silently dropping unexpected input. ([#6299](https://github.com/langchain-ai/deepagents/pull/6299))
+- Correct `FileInfo.size` to represent the file size in bytes across backends. ([#6258](https://github.com/langchain-ai/deepagents/pull/6258))
+
+## [0.7.17](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.16...deepagents==0.7.17) (2026-09-22)
+
+### Bug Fixes
+
+- Preserve the backend exit status when capture metadata is missing. ([#6451](https://github.com/langchain-ai/deepagents/pull/6451))
+- Restrict inline file blocks to supported MIME types. ([#6447](https://github.com/langchain-ai/deepagents/pull/6447))
+
+## [0.7.16](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.15...deepagents==0.7.16) (2026-09-21)
+
+### Features
+
+- Reload skills when `skills_metadata` is reset to `None` ([#6364](https://github.com/langchain-ai/deepagents/pull/6364)).
+
+### Bug Fixes
+
+- Reject parallel edits to the same file to prevent conflicting changes ([#6446](https://github.com/langchain-ai/deepagents/pull/6446)).
+
 ## [0.7.15](https://github.com/langchain-ai/deepagents/compare/deepagents==0.7.14...deepagents==0.7.15) (2026-09-16)
 
 ### Bug Fixes

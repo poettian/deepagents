@@ -71,7 +71,6 @@ from deepagents_code.agent import DEFAULT_AGENT_NAME
 from deepagents_code.config import (
     SHELL_ALLOW_ALL,
     build_langsmith_thread_url,
-    create_model,
     get_glyphs,
     is_ascii_mode,
     is_shell_command_allowed,
@@ -84,7 +83,6 @@ from deepagents_code.hooks import (
     drain_pending_hooks,
 )
 from deepagents_code.hooks.transcript import SUBAGENT_TRANSCRIPT_ID_METADATA_KEY
-from deepagents_code.model_config import ModelConfigError
 from deepagents_code.model_retry import (
     INTERRUPTED_TOOL_OUTPUT,
     RETRY_BOUNDARY_LINE,
@@ -531,14 +529,14 @@ class StreamState:
     )
     """Requests already counted in this headless run.
 
-    Keyed by message ID, or by `(attempt_scope, message_id)` while a model
-    attempt lifecycle scope is open (see `UsageLedgerKey`). Monotonic across
+    Keyed by `ModelInvocationKey` when known, with `MessageUsageKey` aliases or
+    fallbacks scoped to the model attempt (see `UsageLedgerKey`). Monotonic across
     HITL resume passes so a replayed message does not add its request, tokens,
     or cost to `stats` again. Each pass closes its entries via
     `finalize_recorded_requests`, which is what extends that guarantee to
     replayed *chunks* -- an open chunked request accepts revisions, so without
     the round boundary a replayed chunk would merge into it a second time -- and
-    which also projects each scoped key down to its bare message ID, since a
+    which also exposes unscoped message aliases, since a
     resume pass replays with no attempt scope open.
     """
 
@@ -2144,6 +2142,9 @@ async def _run_agent_loop(
         spinner=spinner,
         show_rubric_iterations=show_rubric_iterations,
     )
+    state.stats.record_invocation(
+        runtime_state.model_name or "", runtime_state.model_provider or ""
+    )
     user_msg: dict[str, Any] = {"role": "user", "content": message}
     if message_kwargs:
         user_msg.update(message_kwargs)
@@ -2803,19 +2804,6 @@ async def run_non_interactive(
         message_kwargs = envelope.message_kwargs
         skill_name = envelope.skill_name
 
-    try:
-        result = create_model(
-            model_name,
-            extra_kwargs=model_params,
-            profile_overrides=profile_override,
-            cli_max_retries=cli_max_retries,
-        )
-    except ModelConfigError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        return 1
-
-    result.apply_to_runtime_state()
-
     thread_id = generate_thread_id()
     from deepagents_code._debug import bind_debug_logging_to_thread
 
@@ -2825,12 +2813,6 @@ async def run_non_interactive(
     if not quiet:
         thread_url_lookup = _start_langsmith_thread_url_lookup(thread_id)
         console.print(Text("Running task non-interactively...", style="dim"))
-        header = _build_non_interactive_header(
-            assistant_id,
-            thread_id,
-            rubric_active=rubric is not None,
-        )
-        console.print(header)
 
     from deepagents_code.client.launch.server_manager import server_session
     from deepagents_code.hooks.client_lifecycle import ClientHookStopError
@@ -2948,6 +2930,16 @@ async def run_non_interactive(
             interactive=False,
             cwd=str(Path.cwd()),
         ) as (agent, _server_proc):
+            metadata = await agent.aget_model_metadata()
+            metadata.apply_to_runtime_state()
+            if not quiet:
+                header = _build_non_interactive_header(
+                    assistant_id,
+                    thread_id,
+                    rubric_active=rubric is not None,
+                )
+                console.print(header)
+
             # Collect MCP preload result (ran concurrently with server startup)
             if mcp_task is not None:
                 try:
@@ -3030,3 +3022,8 @@ async def run_non_interactive(
             await drain_pending_hooks()
         except Exception:
             logger.warning("Hook drain raised unexpectedly before exit", exc_info=True)
+        finally:
+            from deepagents_code.thread_ownership import held_lease
+
+            if lease := held_lease(thread_id):
+                lease.release()

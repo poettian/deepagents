@@ -1,3 +1,3 @@
 # Files
 
-- [Testing Strategy and Local Test Guide](testing-guide.md) - Select package-local correctness, integration, benchmark, and evaluation coverage, and separately validate repository automation through workflow YAML contracts and executable shell harnesses. Includes focused Talon regression routes for cron, delegation, host lifecycle, delivery, and unattended authority.
+- [Testing Guide](testing-guide.md) - Package-scoped, deterministic test routing for Deep Agents skills, dcode state and UI behavior, Talon Slack boundaries, and generated artifacts. Use it to select the smallest test that proves a changed observable contract.

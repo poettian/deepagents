@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sqlite3
+from contextlib import asynccontextmanager, closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
@@ -12,10 +13,234 @@ import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from deepagents_code import sessions
+from deepagents_code._constants import DEFAULT_THREAD_LIMIT
+from deepagents_code._env_vars import RECENT_THREADS
 from deepagents_code.app import TextualSessionState
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     import aiosqlite
+    from langchain_core.runnables import RunnableConfig
+
+
+async def test_thread_seed_is_resumable_and_preserves_later_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recovery seed supports preview and continuation without replacing work."""
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from langchain_core.messages import HumanMessage
+
+    from deepagents_code.thread_ownership import OWNER_KEY, ensure_owned, held_lease
+
+    monkeypatch.setattr(sessions, "get_db_path", lambda: tmp_path / "sessions.db")
+    values = {"messages": [HumanMessage("Saved summary")]}
+    await sessions.save_thread_seed(
+        "child", values, agent_name="agent", cwd=str(tmp_path)
+    )
+    threads = await sessions.list_threads(agent_name="agent", cwd=str(tmp_path))
+    await sessions.populate_thread_checkpoint_details(threads)
+    assert len(threads) == 1
+    assert threads[0]["initial_prompt"] == "Saved summary"
+    assert threads[0]["message_count"] == 1
+
+    assert held_lease("child") is None
+    lease = ensure_owned("child")
+    try:
+        async with sessions.get_checkpointer() as checkpointer:
+            graph = create_agent(
+                FakeListChatModel(responses=["Continued reply"]),
+                checkpointer=checkpointer,
+            )
+            config: RunnableConfig = {
+                "configurable": {"thread_id": "child", OWNER_KEY: lease.token}
+            }
+            state = await graph.aget_state(config)
+            assert not state.next
+            await graph.ainvoke({"messages": [HumanMessage("Continue")]}, config)
+            await sessions.save_thread_seed(
+                "child", values, agent_name="agent", cwd=str(tmp_path)
+            )
+            assert held_lease("child") is lease
+            state = await graph.aget_state(config)
+            assert [message.text for message in state.values["messages"]] == [
+                "Saved summary",
+                "Continue",
+                "Continued reply",
+            ]
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_failed_thread_seed_releases_reservation(
+    failure: type[BaseException], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted local seed must not prevent a later handoff attempt."""
+    from deepagents_code.thread_ownership import try_acquire
+
+    monkeypatch.setattr(sessions, "get_db_path", lambda: tmp_path / "sessions.db")
+    with monkeypatch.context() as scoped:
+        scoped.setattr(sessions, "_save_thread_seed", AsyncMock(side_effect=failure))
+        with pytest.raises(failure):
+            await sessions.save_thread_seed(
+                "child", {"messages": []}, agent_name="agent", cwd=str(tmp_path)
+            )
+    lease = try_acquire("child")
+    assert lease is not None
+    lease.release()
+    await sessions.save_thread_seed(
+        "child", {"messages": []}, agent_name="agent", cwd=str(tmp_path)
+    )
+    assert await sessions.thread_exists("child")
+
+
+async def test_activity_refresh_preserves_seed_creation_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated remote activity changes recency without changing creation order."""
+    monkeypatch.setattr(sessions, "get_db_path", lambda: tmp_path / "sessions.db")
+    created = datetime(2025, 1, 1, tzinfo=UTC)
+    for offset, thread_id in enumerate(("older", "newer")):
+        await sessions.save_thread_seed(
+            thread_id, {"messages": []}, agent_name="agent", cwd=str(tmp_path)
+        )
+        async with sessions._connect() as conn:
+            await conn.execute(
+                "UPDATE checkpoints SET metadata = json_set(metadata, "
+                "'$.updated_at', ?) WHERE thread_id = ?",
+                ((created + timedelta(days=offset)).isoformat(), thread_id),
+            )
+            await conn.commit()
+
+    for days in (2, 3):
+        updated = created + timedelta(days=days)
+        await sessions.refresh_thread_activity("older", updated)
+        by_creation = await sessions.list_threads(sort_by="created")
+        assert [thread["thread_id"] for thread in by_creation] == ["newer", "older"]
+        assert by_creation[1]["created_at"] == created.isoformat()
+        assert by_creation[1]["updated_at"] == updated.isoformat()
+        by_activity = await sessions.list_threads(sort_by="updated")
+        assert [thread["thread_id"] for thread in by_activity] == ["older", "newer"]
+
+
+async def test_thread_name_survives_checkpoints_and_manual_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from langchain_core.messages import HumanMessage
+
+    from deepagents_code.thread_ownership import OWNER_KEY, ensure_owned
+
+    monkeypatch.setattr(sessions, "get_db_path", lambda: tmp_path / "sessions.db")
+    await sessions.save_thread_seed(
+        "named",
+        {"messages": [HumanMessage("Start")]},
+        agent_name="agent",
+        cwd=str(tmp_path),
+    )
+    assert await sessions.rename_thread("named", "First title", only_if_unnamed=True)
+    assert await sessions.rename_thread("named", "  Manual title  ")
+    assert not await sessions.rename_thread("named", "Late auto", only_if_unnamed=True)
+    lease = ensure_owned("named")
+    try:
+        async with sessions.get_checkpointer() as checkpointer:
+            graph = create_agent(
+                FakeListChatModel(responses=["Reply"]), checkpointer=checkpointer
+            )
+            await graph.ainvoke(
+                {"messages": [HumanMessage("Continue")]},
+                {"configurable": {"thread_id": "named", OWNER_KEY: lease.token}},
+            )
+    finally:
+        lease.release()
+    assert await sessions.get_thread_name("named") == "Manual title"
+    assert (await sessions.list_threads())[0]["thread_name"] == "Manual title"
+    assert await sessions.delete_thread("named")
+    assert await sessions.get_thread_name("named") is None
+    assert not await sessions.rename_thread("named", "Late auto", only_if_unnamed=True)
+
+
+async def test_concurrent_generated_names_have_one_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sessions, "get_db_path", lambda: tmp_path / "sessions.db")
+    assert not await sessions.rename_thread("missing", "Name")
+    await sessions.save_thread_seed("named", {}, agent_name="agent", cwd=str(tmp_path))
+    results = await asyncio.gather(
+        sessions.rename_thread("named", "First", only_if_unnamed=True),
+        sessions.rename_thread("named", "Second", only_if_unnamed=True),
+    )
+    assert sorted(results) == [False, True]
+    assert await sessions.get_thread_name("named") == (
+        "First" if results[0] else "Second"
+    )
+
+
+@pytest.mark.parametrize("index_version", [2, 3])
+async def test_named_thread_listing_does_not_need_a_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    index_version: int,
+) -> None:
+    """Listing names reuses existing indexes while another connection writes."""
+    db_path = tmp_path / "sessions.db"
+    monkeypatch.setattr(sessions, "get_db_path", lambda: db_path)
+    for thread_id in ("named", "legacy", "unnamed"):
+        await sessions.save_thread_seed(
+            thread_id, {}, agent_name="agent", cwd=str(tmp_path)
+        )
+    await sessions.rename_thread("named", "Saved name")
+    async with sessions._connect() as conn:
+        await conn.execute(
+            "UPDATE checkpoints SET metadata = json_set(metadata, '$.thread_name', ?) "
+            "WHERE thread_id IN ('named', 'legacy')",
+            ("Checkpoint name",),
+        )
+        columns = (
+            "thread_id, json_extract(metadata, '$.updated_at'), "
+            "COALESCE(json_extract(metadata, '$.created_at'), "
+            "json_extract(metadata, '$.updated_at')), checkpoint_id, "
+            "json_extract(metadata, '$.agent_name'), "
+            "json_extract(metadata, '$.git_branch'), json_extract(metadata, '$.cwd')"
+        )
+        if index_version == 3:
+            columns += ", json_extract(metadata, '$.thread_name')"
+        await conn.execute(
+            f"CREATE INDEX idx_dcode_threads_list_v{index_version} "
+            f"ON checkpoints({columns})"
+        )
+        await conn.commit()
+
+    connect = sessions._connect
+
+    @asynccontextmanager
+    async def fail_fast_connection() -> "AsyncIterator[aiosqlite.Connection]":
+        async with connect() as conn:
+            await conn.execute("PRAGMA busy_timeout = 0")
+            yield conn
+
+    monkeypatch.setattr(sessions, "_connect", fail_fast_connection)
+    with closing(sqlite3.connect(db_path)) as writer, writer:
+        writer.execute("BEGIN IMMEDIATE")
+        threads = await sessions.list_threads()
+    assert {thread["thread_id"]: thread.get("thread_name") for thread in threads} == {
+        "named": "Saved name",
+        "legacy": "Checkpoint name",
+        "unnamed": None,
+    }
+    assert "database is locked" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "name", ["", "  ", "x" * 51, "a\nb", "a\x1bb", "a\x07b", "a\x9cb"]
+)
+def test_invalid_thread_names(name: str) -> None:
+    with pytest.raises(ValueError, match="Thread names must"):
+        sessions.validate_thread_name(name)
 
 
 class TestGenerateThreadId:
@@ -311,21 +536,6 @@ class TestThreadFunctions:
         assert result is False
         # ...but its stranded archive is removed regardless.
         assert not archive.exists()
-
-
-class TestGetCheckpointer:
-    """Tests for get_checkpointer async context manager."""
-
-    def test_returns_async_sqlite_saver(self, tmp_path):
-        """Get checkpointer returns AsyncSqliteSaver."""
-
-        async def _test() -> None:
-            db_path = tmp_path / "test.db"
-            with patch.object(sessions, "get_db_path", return_value=db_path):
-                async with sessions.get_checkpointer() as cp:
-                    assert "AsyncSqliteSaver" in type(cp).__name__
-
-        asyncio.run(_test())
 
 
 class TestFormatTimestamp:
@@ -922,7 +1132,7 @@ class TestPrewarmThreadMessageCounts:
             ),
             patch.object(
                 sessions,
-                "populate_thread_checkpoint_details",
+                "_enrich_thread_checkpoint_details",
                 new_callable=AsyncMock,
                 return_value=threads,
             ) as mock_populate,
@@ -933,6 +1143,7 @@ class TestPrewarmThreadMessageCounts:
             threads,
             include_message_count=True,
             include_initial_prompt=False,
+            source="startup-prewarm",
         )
 
 
@@ -1184,6 +1395,47 @@ class TestMessageCountFromCheckpointBlob:
 class TestGetThreadLimit:
     """Tests for get_thread_limit() env var parsing."""
 
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (None, DEFAULT_THREAD_LIMIT),
+            ("invalid", DEFAULT_THREAD_LIMIT),
+            ("7", 7),
+            ("0", 1),
+            ("-5", 1),
+        ],
+    )
+    def test_environment_limit(
+        self, monkeypatch: pytest.MonkeyPatch, value: str | None, expected: int
+    ) -> None:
+        if value is None:
+            monkeypatch.delenv(RECENT_THREADS, raising=False)
+        else:
+            monkeypatch.setenv(RECENT_THREADS, value)
+        assert sessions.get_thread_limit() == expected
+
+    @pytest.mark.parametrize("limit", [None, 7])
+    async def test_database_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: int | None
+    ) -> None:
+        monkeypatch.setattr(sessions, "get_db_path", lambda: tmp_path / "threads.db")
+        async with sessions._connect() as conn:
+            await conn.execute(
+                "CREATE TABLE checkpoints (thread_id TEXT, checkpoint_ns TEXT, "
+                "checkpoint_id TEXT, metadata BLOB)"
+            )
+            await conn.executemany(
+                "INSERT INTO checkpoints VALUES (?, '', 'cp', '{}')",
+                [(f"thread-{i}",) for i in range(DEFAULT_THREAD_LIMIT + 1)],
+            )
+            await conn.commit()
+        threads = (
+            await sessions.list_threads()
+            if limit is None
+            else await sessions.list_threads(limit=limit)
+        )
+        assert len(threads) == (DEFAULT_THREAD_LIMIT if limit is None else limit)
+
 
 class TestListThreadsSortAndBranch:
     """Tests for sort_by and branch params on list_threads."""
@@ -1390,6 +1642,42 @@ class TestListThreadsCommandConfigDefaults:
     }
 
 
+class TestListThreadsCommandNames:
+    """Thread listing exposes literal names without a prompt fallback."""
+
+    async def test_names_render_as_plain_text(self) -> None:
+        from io import StringIO
+
+        from rich.console import Console
+
+        threads: list[sessions.ThreadInfo] = [
+            {
+                "thread_id": "named",
+                "agent_name": "bot",
+                "thread_name": "[bold]Login[/bold]",
+                "updated_at": None,
+            },
+            {
+                "thread_id": "unnamed",
+                "agent_name": "bot",
+                "initial_prompt": "Not a name",
+                "updated_at": None,
+            },
+        ]
+        output = StringIO()
+        console = Console(file=output, width=160, color_system=None)
+        with (
+            patch.object(sessions, "list_threads", AsyncMock(return_value=threads)),
+            patch("deepagents_code.config.console", console),
+        ):
+            await sessions.list_threads_command(sort_by="updated", relative=False)
+        rendered = output.getvalue()
+        assert "Name" in rendered
+        assert "[bold]Login[/bold]" in rendered
+        assert "unnamed" in rendered
+        assert "Not a name" not in rendered
+
+
 class TestListThreadsCommandJson:
     """Tests for list_threads_command JSON output."""
 
@@ -1447,6 +1735,38 @@ class TestBatchCheckpointSummaries:
         assert results["t1"].message_count == 1
         assert results["t1"].initial_prompt == "hello"
         assert results["t2"].message_count == 1
+
+    async def test_selects_latest_checkpoint_across_namespaces(self) -> None:
+        """The latest checkpoint should win without filtering its namespace."""
+        serde = JsonPlusSerializer()
+        older = serde.dumps_typed({"channel_values": {"messages": []}})
+        newer = serde.dumps_typed(
+            {"channel_values": {"messages": [{"role": "user", "content": "new"}]}}
+        )
+
+        import aiosqlite
+
+        async with aiosqlite.connect(":memory:") as conn:
+            await conn.execute(
+                "CREATE TABLE checkpoints "
+                "(thread_id TEXT, checkpoint_ns TEXT, checkpoint_id TEXT, "
+                "type TEXT, checkpoint BLOB, metadata TEXT)"
+            )
+            await conn.executemany(
+                "INSERT INTO checkpoints VALUES (?, ?, ?, ?, ?, '{}')",
+                [
+                    ("t1", "", "cp_1", older[0], older[1]),
+                    ("t1", "subgraph", "cp_2", newer[0], newer[1]),
+                ],
+            )
+            await conn.commit()
+
+            results = await sessions._load_latest_checkpoint_summaries_batch(
+                conn, ["t1"], serde
+            )
+
+        assert results["t1"].message_count == 1
+        assert results["t1"].initial_prompt == "new"
 
     async def test_batch_chunking_returns_all_results(self) -> None:
         """Chunking across multiple batches should merge all results."""
@@ -1546,6 +1866,37 @@ class TestLoadInitialPromptsFromWritesBatch:
             await conn.commit()
 
             results = await sessions._load_initial_prompts_from_writes_batch(  # pyright: ignore[reportPrivateUsage]
+                conn, ["t1"], serde
+            )
+
+        assert results == {"t1": "first"}
+
+    async def test_preserves_namespace_and_channel_selection(self) -> None:
+        """Earliest messages write should win regardless of its namespace."""
+        serde = JsonPlusSerializer()
+        first = serde.dumps_typed([{"role": "user", "content": "first"}])
+        later = serde.dumps_typed([{"role": "user", "content": "later"}])
+        ignored = serde.dumps_typed([{"role": "user", "content": "ignored"}])
+
+        import aiosqlite
+
+        async with aiosqlite.connect(":memory:") as conn:
+            await conn.execute(
+                "CREATE TABLE writes "
+                "(thread_id TEXT, checkpoint_ns TEXT, checkpoint_id TEXT, "
+                "task_id TEXT, idx INTEGER, channel TEXT, type TEXT, value BLOB)"
+            )
+            await conn.executemany(
+                "INSERT INTO writes VALUES (?, ?, ?, '', ?, ?, ?, ?)",
+                [
+                    ("t1", "subgraph", "cp_a", 1, "messages", first[0], first[1]),
+                    ("t1", "", "cp_b", 0, "messages", later[0], later[1]),
+                    ("t1", "", "cp_0", 0, "other", ignored[0], ignored[1]),
+                ],
+            )
+            await conn.commit()
+
+            results = await sessions._load_initial_prompts_from_writes_batch(
                 conn, ["t1"], serde
             )
 

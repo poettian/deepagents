@@ -89,7 +89,7 @@ def tavily_search(
 
 
 @tool(parse_docstring=True)
-def think_tool(reflection: str) -> str:
+def think_tool_raw(reflection: str) -> str:
     """Tool for strategic reflection on research progress and decision-making.
 
     Use this tool after each search to analyze results and plan next steps systematically.
@@ -114,3 +114,31 @@ def think_tool(reflection: str) -> str:
         Confirmation that reflection was recorded for decision-making
     """
     return f"Reflection recorded: {reflection}"
+
+
+@tool(parse_docstring=True)
+def think_tool(reflection: str) -> str:
+    """用于对研究进展进行策略性反思和决策的工具。
+
+    每次搜索后使用此工具，系统地分析结果并规划下一步。
+    它会在研究流程中安排一次有意的停顿，帮助做出高质量的决策。
+
+    使用时机：
+    - 收到搜索结果后：我找到了哪些关键信息？
+    - 决定下一步之前：我掌握的信息是否足以给出全面的回答？
+    - 评估研究缺口时：我还缺少哪些具体信息？
+    - 结束研究之前：我现在能给出完整的回答了吗？
+
+    反思应涵盖：
+    1. 当前发现分析：我收集到了哪些具体信息？
+    2. 缺口评估：还缺少哪些关键信息？
+    3. 质量评估：我是否有足够的证据或示例来支撑一个好的回答？
+    4. 策略决策：应该继续搜索，还是给出回答？
+
+    Args:
+        reflection: 你对研究进展、发现、缺口和下一步计划的详细反思
+
+    Returns:
+        确认反思已记录，用于后续决策
+    """
+    return f"反思已记录：{reflection}"
